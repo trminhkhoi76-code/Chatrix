@@ -1,0 +1,139 @@
+name: Terraform Plan
+on:
+  pull_request:
+    types: [ opened, synchronize, reopened, ready_for_review ]
+    branches:
+      - 'feature/**'
+      - develop
+      - main
+    paths:
+      - terraform/**
+      - .github/workflows/terraform-plan.yml
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: ap-northeast-1
+  DEV_GITHUB_ROLE: Chatrix-GithubAction
+  DEV_AWS_ACCOUNT_ID: 151062089420
+  TF_VERSION: 1.11.4
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan
+    if: |
+      (startsWith(github.event.pull_request.base.ref, 'feature/') && startsWith(github.head_ref, 'feature/')) ||
+      (github.event.pull_request.base.ref == 'develop' && (startsWith(github.head_ref, 'feature/') || startsWith(github.head_ref, 'hotfix/'))) ||
+      (github.event.pull_request.base.ref == 'main' && (startsWith(github.head_ref, 'release/') || startsWith(github.head_ref, 'hotfix/')))
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) Checkout
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4
+
+      # 2) Setup Terraform
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@651471c36a6092792c552e8b1bef71e592b462d8  # v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # 3) Resolve env/account from branch
+      - name: Resolve environment/account by branch
+        id: resolve
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [[ ("$BASE_REF" =~ ^feature/ || "$BASE_REF" == "develop") && "$HEAD_REF" =~ ^feature/ ]]; then
+            echo "tf_env=dev" >> "$GITHUB_OUTPUT"
+            echo "aws_account_id=${{ env.DEV_AWS_ACCOUNT_ID }}" >> "$GITHUB_OUTPUT"
+            echo "github_oidc_role=${{ env.DEV_GITHUB_ROLE }}" >> "$GITHUB_OUTPUT"
+            echo "AWS_ACCOUNT_ID=${{ env.DEV_AWS_ACCOUNT_ID }}" >> $GITHUB_ENV
+            echo "GITHUB_OIDC_ROLE=${{ env.DEV_GITHUB_ROLE }}" >> $GITHUB_ENV
+          elif [[ "$BASE_REF" == "main" && ( "$HEAD_REF" =~ ^release/ || "$HEAD_REF" =~ ^hotfix/ ) ]]; then
+            echo "tf_env=prod" >> "$GITHUB_OUTPUT"
+            echo "aws_account_id=${{ env.PROD_AWS_ACCOUNT_ID }}" >> "$GITHUB_OUTPUT"
+            echo "github_oidc_role=${{ env.PROD_GITHUB_ROLE }}" >> "$GITHUB_OUTPUT"
+            echo "AWS_ACCOUNT_ID=${{ env.PROD_AWS_ACCOUNT_ID }}" >> $GITHUB_ENV
+            echo "GITHUB_OIDC_ROLE=${{ env.PROD_GITHUB_ROLE }}" >> $GITHUB_ENV
+          else
+            echo "Unsupported branch mapping: BASE_REF=$BASE_REF, HEAD_REF=$HEAD_REF" >&2
+            exit 1
+          fi
+
+      # 4) Configure AWS OIDC
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/${{ env.GITHUB_OIDC_ROLE }}
+          role-duration-seconds: 900
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 5) Terraform init
+      - name: Terraform Init
+        id: init
+        working-directory: terraform/environments/${{ steps.resolve.outputs.tf_env }}
+        run: terraform init 2>&1
+        continue-on-error: true
+
+      - name: Terraform Init Debug
+        if: steps.init.outcome == 'failure'
+        run: |
+          echo "::error::Terraform Init Failed"
+          echo "Working directory: terraform/environments/${{ steps.resolve.outputs.tf_env }}"
+          ls -la terraform/environments/${{ steps.resolve.outputs.tf_env }}
+
+      # 6) Terraform validate
+      - name: Terraform Validate
+        id: validate
+        working-directory: terraform/environments/${{ steps.resolve.outputs.tf_env }}
+        run: terraform validate 2>&1
+        continue-on-error: true
+
+      - name: Terraform Validate Debug
+        if: steps.validate.outcome == 'failure'
+        run: |
+          echo "::error::Terraform Validate Failed"
+          cd terraform/environments/${{ steps.resolve.outputs.tf_env }}
+          terraform validate
+
+      # 7) Terraform plan
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform/environments/${{ steps.resolve.outputs.tf_env }}
+        continue-on-error: true
+        run: |
+          PLAN_FILE="plan_output_pr${{ github.event.pull_request.number }}_run${{ github.run_id }}.txt"
+          PLAN_LOG="plan_error_pr${{ github.event.pull_request.number }}_run${{ github.run_id }}.log"
+
+          echo "plan_log=$PLAN_LOG" >> "$GITHUB_OUTPUT"
+
+          terraform plan -no-color -detailed-exitcode -out=tfplan 2>&1 | tee "$PLAN_LOG"
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ $EXIT_CODE -eq 1 ]; then
+            # Keep only error log on plan failure
+            exit 1
+          fi
+
+          # For exit code 0/2, export rendered plan
+          echo "plan_file=$PLAN_FILE" >> "$GITHUB_OUTPUT"
+          terraform show -no-color tfplan > "$PLAN_FILE"
+
+      # 8) Upload plan/log artifact
+      - name: Upload full plan artifact
+        if: always() && steps.resolve.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-pr${{ github.event.pull_request.number }}-${{ steps.resolve.outputs.tf_env }}-${{ github.run_id }}
+          path: |
+            terraform/environments/${{ steps.resolve.outputs.tf_env }}/${{ steps.plan.outputs.plan_file }}
+            terraform/environments/${{ steps.resolve.outputs.tf_env }}/${{ steps.plan.outputs.plan_log }}
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,0 +1,145 @@
+name: Terraform Apply
+
+on:
+  pull_request:
+    types: [ closed ]
+    branches:
+      - 'feature/**'
+      - develop
+      - main
+    paths:
+      - terraform/**
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: ap-northeast-1
+  DEV_GITHUB_ROLE: PaymentPortal-GithubAction
+  DEV_AWS_ACCOUNT_ID: 695410536085
+  TF_VERSION: 1.11.4
+
+jobs:
+  resolve-environment:
+    if: |
+      github.event.pull_request.merged == true && (
+        (startsWith(github.event.pull_request.base.ref, 'feature/') && startsWith(github.head_ref, 'feature/')) ||
+        (github.event.pull_request.base.ref == 'develop' && (startsWith(github.head_ref, 'feature/') || startsWith(github.head_ref, 'hotfix/'))) ||
+        (github.event.pull_request.base.ref == 'main' && (startsWith(github.head_ref, 'release/') || startsWith(github.head_ref, 'hotfix/')))
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      environment: ${{ steps.resolve.outputs.tf_env }}
+      aws-account-id: ${{ steps.resolve.outputs.aws_account_id }}
+      github-role: ${{ steps.resolve.outputs.github_role }}
+    steps:
+      - name: Resolve AWS account by branch
+        id: resolve
+        shell: bash
+        run: |
+          ref_name="${{ github.base_ref }}"
+          
+          # Determine environment based on branch
+          if [[ "$ref_name" == "main" ]]; then
+            echo "tf_env=prod" >> "$GITHUB_OUTPUT"
+            echo "aws_account_id=${{ env.PROD_AWS_ACCOUNT_ID }}" >> "$GITHUB_OUTPUT"
+            echo "github_role=${{ env.PROD_GITHUB_ROLE }}" >> "$GITHUB_OUTPUT"
+          elif [[ "$ref_name" == "develop" ]]; then
+            echo "tf_env=dev" >> "$GITHUB_OUTPUT"
+            echo "aws_account_id=${{ env.DEV_AWS_ACCOUNT_ID }}" >> "$GITHUB_OUTPUT"
+            echo "github_role=${{ env.DEV_GITHUB_ROLE }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unsupported branch: $ref_name" >&2
+            exit 1
+          fi
+          
+          # Log branch for debugging
+          echo "Branch: $ref_name" >> $GITHUB_STEP_SUMMARY
+
+  apply-terraform:
+    needs: resolve-environment
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    environment:
+      name: ${{ needs.resolve-environment.outputs.environment }}
+      url: https://console.aws.amazon.com/
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ needs.resolve-environment.outputs.aws-account-id }}:role/${{ needs.resolve-environment.outputs.github-role }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: terraform/environments/${{ needs.resolve-environment.outputs.environment }}
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform/environments/${{ needs.resolve-environment.outputs.environment }}
+        shell: bash
+        run: |
+          set +e  # Disable exit on error for entire script
+          PLAN_FILE="plan_output_run${{ github.run_id }}.txt"
+
+          # Run terraform plan and capture exit code (0=no changes, 2=changes, 1=error)
+          terraform plan -detailed-exitcode -no-color -out=tfplan
+          PLAN_EXIT=$?
+
+          echo "Plan exit code: $PLAN_EXIT"
+
+          if [ $PLAN_EXIT -eq 1 ]; then
+            echo "terraform plan failed"
+            exit 1
+          fi
+
+          if [ $PLAN_EXIT -eq 2 ]; then
+            echo "Changes detected in terraform plan"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No changes detected"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Show the plan output
+          terraform show -no-color tfplan > "$PLAN_FILE" 2>&1 || true
+          echo "plan_file=$PLAN_FILE" >> "$GITHUB_OUTPUT"
+
+          # Display plan output for debugging
+          echo "=== Terraform Plan Output ==="
+          cat "$PLAN_FILE"
+
+      - name: Debug Plan Output
+        if: always()
+        shell: bash
+        run: |
+          echo "has_changes output: ${{ steps.plan.outputs.has_changes }}"
+          echo "plan_file output: ${{ steps.plan.outputs.plan_file }}"
+
+      - name: Upload Terraform Plan
+        if: steps.plan.outputs.has_changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: terraform/environments/${{ needs.resolve-environment.outputs.environment }}/tfplan
+
+      - name: Terraform Apply
+        if: steps.plan.outputs.has_changes == 'true'
+        working-directory: terraform/environments/${{ needs.resolve-environment.outputs.environment }}
+        run: terraform apply -auto-approve tfplan
