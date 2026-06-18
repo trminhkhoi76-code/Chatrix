@@ -17,8 +17,8 @@ permissions:
 
 env:
   AWS_REGION: ap-northeast-1
-  DEV_GITHUB_ROLE: PaymentPortal-GithubAction
-  DEV_AWS_ACCOUNT_ID: 695410536085
+  PRO_GITHUB_ROLE: PaymentPortal-GithubAction
+  PRO_AWS_ACCOUNT_ID: 695410536085
   TF_VERSION: 1.11.4
 
 jobs:
