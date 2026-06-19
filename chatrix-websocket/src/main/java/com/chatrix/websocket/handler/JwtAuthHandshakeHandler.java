@@ -44,6 +44,14 @@ public class JwtAuthHandshakeHandler extends ChannelInboundHandlerAdapter {
             ctx.channel().attr(ChannelAttributes.USER_ID).set(userId);
             log.debug("Authenticated WebSocket connection for userId={}", userId);
 
+            // Strip query string so WebSocketServerProtocolHandler can match on exact path.
+            // The token was already extracted above; the query string is no longer needed.
+            String uri = request.uri();
+            int queryIndex = uri.indexOf('?');
+            if (queryIndex >= 0) {
+                request.setUri(uri.substring(0, queryIndex));
+            }
+
             // Remove this handler after successful auth — it's only needed for the handshake
             ctx.pipeline().remove(this);
         }
