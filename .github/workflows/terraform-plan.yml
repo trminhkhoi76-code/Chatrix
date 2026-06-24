@@ -1,0 +1,165 @@
+name: Terraform Plan
+
+# Runs on every PR touching terraform — posts plan diff as a PR comment.
+# Required GitHub Secret:
+#   TF_TFVARS — full content of terraform/terraform.tfvars (copy from terraform.tfvars.example)
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform-plan.yml'
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  terraform-plan:
+    name: Plan (${{ github.base_ref }})
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54531c595669bbf4fdcad122b0f91b8f1a56 # v3.1.2
+        with:
+          terraform_version: 1.8.5
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: arn:aws:iam::151062089420:role/Chatrix-GithubAction
+          aws-region: ap-northeast-1
+
+      - name: Write terraform.tfvars
+        env:
+          TF_TFVARS: ${{ secrets.TF_TFVARS }}
+        run: printf '%s\n' "$TF_TFVARS" > terraform/modules/terraform.tfvars
+
+      - name: Terraform Init
+        id: init
+        working-directory: terraform/modules
+        run: terraform init -input=false
+        continue-on-error: true
+
+      - name: Terraform Format Check
+        id: fmt
+        working-directory: terraform/modules
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Validate
+        id: validate
+        if: steps.init.outcome == 'success'
+        working-directory: terraform/modules
+        run: terraform validate -no-color
+        continue-on-error: true
+
+      - name: Terraform Plan
+        id: plan
+        if: steps.init.outcome == 'success'
+        working-directory: terraform/modules
+        run: |
+          terraform plan \
+            -no-color \
+            -input=false \
+            -out=tfplan \
+            2>&1 | tee plan_output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Upload plan artifact
+        if: steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45c72b # v4.6.0
+        with:
+          name: tfplan-pr${{ github.event.pull_request.number }}-${{ github.run_id }}
+          path: terraform/modules/plan_output.txt
+          retention-days: 14
+
+      - name: Post plan comment on PR
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        if: always() && github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs   = require('fs');
+            const path = require('path');
+
+            const initOutcome     = '${{ steps.init.outcome }}';
+            const fmtOutcome      = '${{ steps.fmt.outcome }}';
+            const validateOutcome = '${{ steps.validate.outcome }}';
+            const planOutcome     = '${{ steps.plan.outcome }}';
+
+            const icon = (s) => s === 'success' ? '✅' : s === 'skipped' ? '⏭️' : '❌';
+
+            let planBody = '';
+            const planPath = path.join('terraform', 'modules', 'plan_output.txt');
+            if (fs.existsSync(planPath)) {
+              planBody = fs.readFileSync(planPath, 'utf8');
+            }
+
+            const MAX = 60000;
+            const truncated  = planBody.length > MAX;
+            const planDisplay = truncated ? planBody.slice(0, MAX) + '\n\n… (truncated — see artifact)' : planBody;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const output = [
+              `### Terraform Plan — PR #${{ github.event.pull_request.number }}`,
+              '',
+              `| Step | Result |`,
+              `|------|--------|`,
+              `| Init | ${icon(initOutcome)} \`${initOutcome}\` |`,
+              `| Format | ${icon(fmtOutcome)} \`${fmtOutcome}\` |`,
+              `| Validate | ${icon(validateOutcome)} \`${validateOutcome}\` |`,
+              `| Plan | ${icon(planOutcome)} \`${planOutcome}\` |`,
+              '',
+              '<details><summary>Show Plan</summary>',
+              '',
+              '```hcl',
+              planDisplay,
+              '```',
+              '',
+              '</details>',
+              '',
+              truncated ? `> ⚠️ Output truncated. [Full plan in workflow artifacts](${runUrl})` : '',
+              '',
+              `*Actor: @${{ github.actor }} · Workflow: \`${{ github.workflow }}\`*`,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('Terraform Plan — PR #${{ github.event.pull_request.number }}')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                comment_id: existing.id,
+                body: output,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: context.issue.number,
+                body: output,
+              });
+            }
+
+      - name: Fail if plan errored
+        if: steps.plan.outcome == 'failure' || steps.init.outcome == 'failure'
+        run: |
+          echo "::error::Terraform plan failed — see PR comment for details"
+          exit 1

@@ -1,4 +1,15 @@
 */target
 .idea
 logs/*
-.terraform
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+*.tfvars
+!terraform.tfvars.example
+terraform.tfstate
+terraform.tfstate.backup
+*.tfstate
+*.tfstate.*
+crash.log

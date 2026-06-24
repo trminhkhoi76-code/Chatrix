@@ -1,0 +1,304 @@
+name: Terraform Apply & Deploy
+
+# Runs on merge to main.
+# - terraform/**  changed  → terraform apply
+# - chatrix-api / chatrix-websocket changed → Maven build → upload JARs to S3 → restart EC2
+#
+# Required GitHub Secret:
+#   TF_TFVARS — full content of terraform/terraform.tfvars (copy from terraform.tfvars.example)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+      - 'chatrix-api/**'
+      - 'chatrix-websocket/**'
+      - 'pom.xml'
+      - '.github/workflows/terraform-apply-and-deploy.yml'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION:      ap-northeast-1
+  OIDC_ROLE:       arn:aws:iam::151062089420:role/Chatrix-GithubAction
+  TF_IN_AUTOMATION: "true"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Detect which parts of the repo changed
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  detect-changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      terraform: ${{ steps.filter.outputs.terraform }}
+      java:      ${{ steps.filter.outputs.java }}
+      api:       ${{ steps.filter.outputs.api }}
+      websocket: ${{ steps.filter.outputs.websocket }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Detect changed paths
+        id: filter
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        with:
+          filters: |
+            terraform:
+              - 'terraform/**'
+            java:
+              - 'chatrix-api/**'
+              - 'chatrix-websocket/**'
+              - 'pom.xml'
+            api:
+              - 'chatrix-api/**'
+            websocket:
+              - 'chatrix-websocket/**'
+              - 'pom.xml'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Terraform Apply  (only when terraform/** changed)
+# ─────────────────────────────────────────────────────────────────────────────
+  apply-terraform:
+    name: Terraform Apply
+    needs: detect-changes
+    if: needs.detect-changes.outputs.terraform == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://console.aws.amazon.com/
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54531c595669bbf4fdcad122b0f91b8f1a56 # v3.1.2
+        with:
+          terraform_version: 1.8.5
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ env.OIDC_ROLE }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Write terraform.tfvars
+        env:
+          TF_TFVARS: ${{ secrets.TF_TFVARS }}
+        run: printf '%s\n' "$TF_TFVARS" > terraform/modules/terraform.tfvars
+
+      - name: Terraform Init
+        working-directory: terraform/modules
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform/modules
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -no-color -input=false -out=tfplan 2>&1 | tee plan_output.txt
+          EXIT=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+          case $EXIT in
+            0) echo "has_changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "has_changes=true"  >> "$GITHUB_OUTPUT" ;;
+            1) echo "::error::terraform plan failed"; exit 1 ;;
+          esac
+
+      - name: Upload plan artifact
+        if: steps.plan.outputs.has_changes == 'true'
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45c72b # v4.6.0
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: |
+            terraform/modules/tfplan
+            terraform/modules/plan_output.txt
+          retention-days: 30
+
+      - name: Terraform Apply
+        if: steps.plan.outputs.has_changes == 'true'
+        working-directory: terraform/modules
+        run: |
+          terraform apply -auto-approve -input=false tfplan
+          echo "=== Terraform Outputs ==="
+          terraform output
+
+      - name: Summary — no changes
+        if: steps.plan.outputs.has_changes == 'false'
+        run: echo "### ✅ Terraform — no infrastructure changes" >> "$GITHUB_STEP_SUMMARY"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Build & Deploy Java services  (only when Java source changed)
+# ─────────────────────────────────────────────────────────────────────────────
+  build-and-deploy:
+    name: Build & Deploy Java
+    needs: [detect-changes, apply-terraform]
+    # Run if Java changed AND (terraform succeeded OR was skipped — not failed)
+    if: >-
+      needs.detect-changes.outputs.java == 'true' &&
+      (needs.apply-terraform.result == 'success' || needs.apply-terraform.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Java 17
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          java-version: '17'
+          distribution: 'corretto'
+          cache: maven
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ env.OIDC_ROLE }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform (to read outputs)
+        uses: hashicorp/setup-terraform@b9cd54531c595669bbf4fdcad122b0f91b8f1a56 # v3.1.2
+        with:
+          terraform_version: 1.8.5
+          terraform_wrapper: false
+
+      - name: Terraform Init & read outputs
+        id: tf-outputs
+        working-directory: terraform/modules
+        run: |
+          terraform init -input=false -reconfigure 2>/dev/null
+          BUCKET=$(terraform output -raw artifacts_bucket_name)
+          EC2_ID=$(terraform output -raw ec2_instance_id)
+          echo "artifacts_bucket=$BUCKET"  >> "$GITHUB_OUTPUT"
+          echo "ec2_instance_id=$EC2_ID"   >> "$GITHUB_OUTPUT"
+          echo "Artifacts bucket : $BUCKET"
+          echo "EC2 instance ID  : $EC2_ID"
+
+      # ── Build ──────────────────────────────────────────────────────────────
+
+      - name: Build chatrix-api
+        if: needs.detect-changes.outputs.api == 'true'
+        run: mvn -pl chatrix-api -am package -DskipTests -q
+
+      - name: Build chatrix-websocket
+        if: needs.detect-changes.outputs.websocket == 'true'
+        run: mvn -pl chatrix-websocket -am package -DskipTests -q
+
+      # ── Upload JARs to S3 ─────────────────────────────────────────────────
+
+      - name: Upload chatrix-api JAR
+        if: needs.detect-changes.outputs.api == 'true'
+        run: |
+          JAR=$(find chatrix-api/target -name "chatrix-api-*.jar" ! -name "*-sources.jar" | head -1)
+          echo "Uploading $JAR → s3://${{ steps.tf-outputs.outputs.artifacts_bucket }}/chatrix-api.jar"
+          aws s3 cp "$JAR" "s3://${{ steps.tf-outputs.outputs.artifacts_bucket }}/chatrix-api.jar"
+
+      - name: Upload chatrix-websocket JAR
+        if: needs.detect-changes.outputs.websocket == 'true'
+        run: |
+          JAR=$(find chatrix-websocket/target -name "*jar-with-dependencies.jar" | head -1)
+          echo "Uploading $JAR → s3://${{ steps.tf-outputs.outputs.artifacts_bucket }}/chatrix-websocket.jar"
+          aws s3 cp "$JAR" "s3://${{ steps.tf-outputs.outputs.artifacts_bucket }}/chatrix-websocket.jar"
+
+      # ── Restart services on EC2 via SSM Run Command ────────────────────────
+
+      - name: Deploy & restart on EC2
+        id: ssm-deploy
+        run: |
+          EC2_ID="${{ steps.tf-outputs.outputs.ec2_instance_id }}"
+          BUCKET="${{ steps.tf-outputs.outputs.artifacts_bucket }}"
+          API_CHANGED="${{ needs.detect-changes.outputs.api }}"
+          WS_CHANGED="${{ needs.detect-changes.outputs.websocket }}"
+
+          # Build the deploy script dynamically based on what changed
+          DEPLOY_SCRIPT="#!/bin/bash
+          set -euo pipefail
+          BUCKET='$BUCKET'
+          "
+
+          if [[ "$API_CHANGED" == "true" ]]; then
+            DEPLOY_SCRIPT+="
+          echo 'Deploying chatrix-api...'
+          aws s3 cp s3://\$BUCKET/chatrix-api.jar /opt/chatrix/chatrix-api.jar
+          chown chatrix:chatrix /opt/chatrix/chatrix-api.jar
+          systemctl restart chatrix-api
+          systemctl is-active --quiet chatrix-api && echo '✅ chatrix-api running' || echo '❌ chatrix-api failed'
+          "
+          fi
+
+          if [[ "$WS_CHANGED" == "true" ]]; then
+            DEPLOY_SCRIPT+="
+          echo 'Deploying chatrix-websocket...'
+          aws s3 cp s3://\$BUCKET/chatrix-websocket.jar /opt/chatrix/chatrix-websocket.jar
+          chown chatrix:chatrix /opt/chatrix/chatrix-websocket.jar
+          systemctl restart chatrix-websocket
+          systemctl is-active --quiet chatrix-websocket && echo '✅ chatrix-websocket running' || echo '❌ chatrix-websocket failed'
+          "
+          fi
+
+          echo "Sending SSM Run Command to EC2: $EC2_ID"
+          COMMAND_ID=$(aws ssm send-command \
+            --region "${{ env.AWS_REGION }}" \
+            --instance-ids "$EC2_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[\"$DEPLOY_SCRIPT\"]" \
+            --comment "Chatrix deploy from GitHub Actions run ${{ github.run_id }}" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+          echo "ssm_command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+          # Wait for command to complete (up to 5 min)
+          for i in $(seq 1 30); do
+            sleep 10
+            STATUS=$(aws ssm get-command-invocation \
+              --region "${{ env.AWS_REGION }}" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_ID" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            echo "[$i/30] SSM status: $STATUS"
+            case "$STATUS" in
+              Success)
+                echo "✅ Deploy succeeded"
+                break
+                ;;
+              Failed|Cancelled|TimedOut|DeliveryTimedOut)
+                echo "::error::SSM Run Command failed with status: $STATUS"
+                aws ssm get-command-invocation \
+                  --region "${{ env.AWS_REGION }}" \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_ID" \
+                  --query "StandardOutputContent" --output text
+                aws ssm get-command-invocation \
+                  --region "${{ env.AWS_REGION }}" \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_ID" \
+                  --query "StandardErrorContent" --output text
+                exit 1
+                ;;
+            esac
+          done
+
+      - name: Write deployment summary
+        if: always()
+        run: |
+          echo "## Chatrix Deploy — Run #${{ github.run_id }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Service | Changed | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|---------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| chatrix-api | ${{ needs.detect-changes.outputs.api }} | ${{ steps.ssm-deploy.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| chatrix-websocket | ${{ needs.detect-changes.outputs.websocket }} | ${{ steps.ssm-deploy.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Commit:** \`${{ github.sha }}\` — ${{ github.event.head_commit.message }}" >> "$GITHUB_STEP_SUMMARY"

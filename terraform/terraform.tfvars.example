@@ -1,0 +1,59 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# NEVER commit terraform.tfvars to git — it contains secrets.
+# Add terraform.tfvars to .gitignore.
+
+# ── General ──────────────────────────────────────────────────────────
+project     = "chatrix"
+environment = "prod"
+aws_region  = "ap-northeast-1"
+
+# ── Networking ───────────────────────────────────────────────────────
+vpc_cidr = "10.0.0.0/16"
+
+# ── EC2 ──────────────────────────────────────────────────────────────
+ec2_instance_type = "t4g.small"
+
+# Leave empty to use SSM Session Manager (no SSH key needed, more secure).
+# Set to an existing key pair name to enable SSH.
+ec2_key_name = ""
+
+# Only used when ec2_key_name is set — restrict to your IP
+allowed_ssh_cidr = "203.0.113.0/32"  # Replace with your IP
+
+# ── Database ─────────────────────────────────────────────────────────
+db_instance_class       = "db.t3.micro"
+db_name                 = "chatrix"
+db_username             = "chatrix"
+db_password             = "P@SSW0rd12345678901"
+db_allocated_storage_gb = 20
+
+# ── Redis ─────────────────────────────────────────────────────────────
+redis_node_type  = "cache.t3.micro"
+redis_auth_token = "P@SSW0rd12345678901"  # 16–128 chars
+
+# ── JWT ──────────────────────────────────────────────────────────────
+# Must be identical on chatrix-api and chatrix-websocket.
+# Generate: openssl rand -base64 48
+jwt_secret = "P@SSW0rd12345678901"
+
+# ── TLS / HTTPS (optional but strongly recommended for production) ────
+# Issue a certificate in ACM for your domain, then paste the ARN here.
+# Leave empty to run plain HTTP (not suitable for production).
+acm_certificate_arn = ""  # e.g. "arn:aws:acm:ap-northeast-1:123456789012:certificate/abc-def"
+domain_name         = ""  # e.g. "chatrix.example.com"
+
+# ── S3 ───────────────────────────────────────────────────────────────
+# Auto-delete uploaded files after N days. Set to 0 to disable.
+uploads_lifecycle_days = 365
+
+# ── Cost-saving schedule ─────────────────────────────────────────────
+# Enable automatic start/stop to save ~$36/month.
+# Cron format uses Asia/Tokyo timezone.
+enable_schedule     = true
+schedule_stop_cron  = "cron(0 20 ? * MON-FRI *)"  # Stop  Mon–Fri 20:00 JST
+schedule_start_cron = "cron(0 8  ? * MON-FRI *)"  # Start Mon–Fri 08:00 JST
+
+# Delete Redis on stop and recreate on start.
+# Saves ~$14/month but adds ~5 min to startup time.
+# Recommended: true for dev/staging, false for production.
+enable_redis_stop = false
