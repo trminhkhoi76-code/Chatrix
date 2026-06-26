@@ -1,0 +1,66 @@
+services:
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: faber_extract_root_pass
+      MYSQL_DATABASE: chatrix
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pfaber_extract_root_pass"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass FaberCompany2016
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "FaberCompany2016", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: chatrix-api/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      DB_URL: jdbc:mysql://mysql:3306/chatrix?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&createDatabaseIfNotExist=true
+      DB_USERNAME: root
+      DB_PASSWORD: faber_extract_root_pass
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: FaberCompany2016
+      JWT_SECRET: chatrix-dev-secret-key-for-local-development-only!!
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  websocket:
+    build:
+      context: .
+      dockerfile: chatrix-websocket/Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      WS_PORT: 8081
+      JWT_SECRET: chatrix-dev-secret-key-for-local-development-only!!
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  mysql_data:
+  redis_data:

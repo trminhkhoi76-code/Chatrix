@@ -1,0 +1,7 @@
+.git
+.github
+.idea
+*.md
+terraform/
+logs/
+**/target/
