@@ -1,6 +1,6 @@
 resource "aws_security_group" "rds" {
   name        = "${var.project}-${var.environment}-rds-sg"
-  description = "RDS MySQL — allow access from EC2 only"
+  description = "RDS MySQL - allow access from EC2 only"
   vpc_id      = var.vpc_id
 
   ingress {

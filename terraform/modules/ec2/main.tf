@@ -1,6 +1,6 @@
 resource "aws_security_group" "ec2" {
   name        = "${var.project}-${var.environment}-ec2-sg"
-  description = "EC2 — allow traffic from ALB only"
+  description = "EC2 - allow traffic from ALB only"
   vpc_id      = var.vpc_id
 
   ingress {

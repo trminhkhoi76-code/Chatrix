@@ -1,7 +1,7 @@
 # Security group — only accepts traffic from the ALB
 resource "aws_security_group" "task" {
   name        = "${var.project}-${var.environment}-${var.service_name}-task-sg"
-  description = "ECS Fargate tasks — ${var.service_name}"
+  description = "ECS Fargate tasks - ${var.service_name}"
   vpc_id      = var.vpc_id
 
   ingress {

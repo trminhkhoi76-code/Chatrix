@@ -1,6 +1,6 @@
 resource "aws_security_group" "valkey" {
   name        = "${var.project}-${var.environment}-valkey-sg"
-  description = "ElastiCache Valkey — allow access from EC2 only"
+  description = "ElastiCache Valkey - allow access from EC2 only"
   vpc_id      = var.vpc_id
 
   ingress {
