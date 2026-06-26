@@ -5,7 +5,6 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - main
-      - feature/*
     paths:
       - 'terraform/**'
       - '.github/workflows/terraform-plan.yml'
@@ -23,7 +22,8 @@ permissions:
 jobs:
   terraform-plan:
     if: |
-      github.base_ref == 'main' && startsWith(github.head_ref, 'release/')
+      github.base_ref == 'main' &&
+      (startsWith(github.head_ref, 'release/') || startsWith(github.head_ref, 'feature/'))
     runs-on: ubuntu-latest
 
     steps:
