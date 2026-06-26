@@ -1,6 +1,6 @@
 resource "aws_security_group" "alb" {
   name        = "${var.project}-${var.environment}-alb-sg"
-  description = "ALB — allow public HTTP/HTTPS"
+  description = "ALB - allow public HTTP/HTTPS"
   vpc_id      = var.vpc_id
 
   ingress {
