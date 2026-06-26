@@ -6,6 +6,7 @@ WORKDIR /workspace
 # Cache dependencies before copying source (layer is reused unless pom changes)
 COPY pom.xml .
 COPY chatrix-api/pom.xml chatrix-api/
+COPY chatrix-websocket/pom.xml chatrix-websocket/
 RUN mvn -B -pl chatrix-api -am dependency:go-offline -q
 
 COPY chatrix-api/src chatrix-api/src
