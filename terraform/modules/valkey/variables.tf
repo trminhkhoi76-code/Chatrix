@@ -1,0 +1,26 @@
+variable "project" {
+  type = string
+}
+
+variable "environment" {
+  type = string
+}
+
+variable "vpc_id" {
+  type = string
+}
+
+variable "subnet_ids" {
+  description = "Private subnet IDs for the cache subnet group"
+  type        = list(string)
+}
+
+variable "node_type" {
+  type    = string
+  default = "cache.t3.micro"
+}
+
+variable "allowed_security_group_id" {
+  description = "Security group allowed to connect to Valkey (EC2 SG)"
+  type        = string
+}
