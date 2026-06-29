@@ -275,6 +275,24 @@ def get_existing_actions(policy_path: Path) -> set:
     return actions
 
 
+def is_covered(action: str, existing: set) -> bool:
+    """Return True if action is granted by the existing action set.
+
+    Handles three levels:
+      "*"           — full wildcard (all services)
+      "ec2:*"       — service-level wildcard
+      "ec2:CreateVpc" — exact action
+    """
+    if "*" in existing or action in existing:
+        return True
+    # service-level wildcard: "ec2:*" covers "ec2:CreateVpc"
+    if ":" in action:
+        service = action.split(":")[0]
+        if f"{service}:*" in existing:
+            return True
+    return False
+
+
 def get_affected_resource_types(plan_path: Path) -> set:
     with open(plan_path) as f:
         plan = json.load(f)
@@ -306,7 +324,7 @@ def main() -> None:
     missing_by_type: dict = {}
     for rtype in sorted(affected_types):
         required = RESOURCE_IAM_MAP.get(rtype, [])
-        missing = [a for a in required if a not in existing]
+        missing = [a for a in required if not is_covered(a, existing)]
         if missing:
             missing_by_type[rtype] = missing
 
