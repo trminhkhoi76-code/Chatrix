@@ -20,7 +20,13 @@ variable "node_type" {
   default = "cache.t3.micro"
 }
 
-variable "allowed_security_group_id" {
-  description = "Security group allowed to connect to Valkey (EC2 SG)"
-  type        = string
+variable "num_cache_clusters" {
+  description = "Number of nodes in the cluster (1 = primary only; >1 enables automatic failover)"
+  type        = number
+  default     = 1
+}
+
+variable "allowed_security_group_ids" {
+  description = "Security group IDs allowed to connect to Valkey on port 6379 (e.g. ECS task SGs)"
+  type        = list(string)
 }

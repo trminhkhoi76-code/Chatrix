@@ -8,15 +8,18 @@ on:
     paths:
       - 'terraform/**'
       - '.github/workflows/terraform-plan.yml'
+      - '.github/scripts/**'
 
 env:
   AWS_ACCOUNT_ID: 151062089420
   AWS_REGION: ap-northeast-1
   GITHUB_OIDC_ROLE: Chatrix-GithubAction
+  POLICY_FILE: terraform/policies/terraform-apply-policy.json
+  TF_WORKING_DIR: terraform/environments/dev
 
 permissions:
   id-token: write
-  contents: read
+  contents: write
   pull-requests: write
 
 jobs:
@@ -29,6 +32,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@651471c36a6092792c552e8b1bef71e592b462d8
@@ -39,11 +45,13 @@ jobs:
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
         with:
           role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/${{ env.GITHUB_OIDC_ROLE }}
-          aws-region: ap-northeast-1
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Init ──────────────────────────────────────────────────────────────────
 
       - name: Terraform Init
         id: init
-        working-directory: terraform/environments/dev
+        working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform init 2>&1
         continue-on-error: true
 
@@ -51,12 +59,14 @@ jobs:
         if: steps.init.outcome == 'failure'
         run: |
           echo "::error::Terraform Init Failed"
-          echo "Working directory: terraform/environments/dev"
-          ls -la
+          echo "Working directory: ${{ env.TF_WORKING_DIR }}"
+          ls -la ${{ env.TF_WORKING_DIR }}
+
+      # ── Validate ──────────────────────────────────────────────────────────────
 
       - name: Terraform Validate
         id: validate
-        working-directory: terraform/environments/dev
+        working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform validate 2>&1
         continue-on-error: true
 
@@ -64,12 +74,14 @@ jobs:
         if: steps.validate.outcome == 'failure'
         run: |
           echo "::error::Terraform Validate Failed"
-          cd terraform/environments/dev
+          cd ${{ env.TF_WORKING_DIR }}
           terraform validate
+
+      # ── Plan ──────────────────────────────────────────────────────────────────
 
       - name: Terraform Plan
         id: plan
-        working-directory: terraform/environments/dev
+        working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
           PLAN_FILE="plan_output_pr${{ github.event.pull_request.number }}_run${{ github.run_id }}.txt"
           terraform plan -no-color -out=tfplan
@@ -82,8 +94,48 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: terraform-plan-pr${{ github.event.pull_request.number }}-dev-${{ github.run_id }}
-          path: terraform/environments/dev/${{ steps.plan.outputs.plan_file }}
+          path: ${{ env.TF_WORKING_DIR }}/${{ steps.plan.outputs.plan_file }}
           retention-days: 14
+
+      # ── IAM Policy Coverage ───────────────────────────────────────────────────
+
+      - name: Export Plan JSON
+        id: plan_json
+        if: steps.plan.outcome == 'success'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform show -json tfplan > plan.json
+
+      - name: Check IAM Policy Coverage
+        id: policy_check
+        if: steps.plan_json.outcome == 'success'
+        run: |
+          python3 .github/scripts/parse_new_resources.py \
+            ${{ env.TF_WORKING_DIR }}/plan.json \
+            ${{ env.POLICY_FILE }} \
+            > policy_analysis.json
+          MISSING_COUNT=$(jq '.all_missing | length' policy_analysis.json)
+          echo "missing_count=$MISSING_COUNT" >> "$GITHUB_OUTPUT"
+          echo "--- Policy analysis ---"
+          cat policy_analysis.json
+
+      - name: Update IAM Policy File
+        id: policy_update
+        if: steps.policy_check.outcome == 'success' && steps.policy_check.outputs.missing_count != '0'
+        run: |
+          python3 .github/scripts/update_policy.py \
+            ${{ env.POLICY_FILE }} \
+            policy_analysis.json
+
+      - name: Commit and Push Policy Update
+        if: steps.policy_update.outcome == 'success'
+        run: |
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add ${{ env.POLICY_FILE }}
+          git diff --cached --quiet || git commit -m "ci: auto-update IAM policy for new Terraform resources [skip ci]"
+          git push origin HEAD:${{ github.head_ref }}
+
+      # ── PR Comment ────────────────────────────────────────────────────────────
 
       - name: Comment PR with Plan Result
         uses: actions/github-script@v7
@@ -95,14 +147,13 @@ jobs:
             const path = require('path');
             const environment = 'dev';
             const planFile = '${{ steps.plan.outputs.plan_file }}';
-            const planDir = `terraform/environments/dev`;
+            const planDir = '${{ env.TF_WORKING_DIR }}';
             const planPath = path.join(planDir, planFile);
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
 
             let planOutput = '';
             let planStatus = '❌ Failed';
 
-            // Check if plan file exists and is readable
             if (planFile && fs.existsSync(planPath)) {
               try {
                 const stats = fs.statSync(planPath);
@@ -120,12 +171,41 @@ jobs:
               planOutput = `Plan file not found at: ${planPath}`;
             }
 
-            // Truncate if too long (GitHub comment limit)
-            const maxLength = 65000;
+            const maxLength = 60000;
             const isTruncated = planOutput.length > maxLength;
-            const truncatedPlan = planOutput.length > maxLength
+            const truncatedPlan = isTruncated
               ? planOutput.substring(0, maxLength) + '\n\n... (truncated)'
               : planOutput;
+
+            // Build IAM policy section
+            let policySection = '';
+            const missingCount = '${{ steps.policy_check.outputs.missing_count }}';
+            if (missingCount === '0') {
+              policySection = '\n\n### ✅ IAM Policy Coverage\n\nAll required IAM actions are already present in `terraform-apply-policy.json`.';
+            } else if (missingCount !== '' && missingCount !== '0') {
+              let analysisJson = {};
+              try {
+                analysisJson = JSON.parse(fs.readFileSync('policy_analysis.json', 'utf8'));
+              } catch (_) {}
+
+              const affectedTypes = (analysisJson.affected_types || []).filter(t => analysisJson.missing && analysisJson.missing[t]);
+              const allMissing = analysisJson.all_missing || [];
+
+              let typesTable = '';
+              for (const rtype of affectedTypes) {
+                const actions = (analysisJson.missing[rtype] || []).join(', ');
+                typesTable += `| \`${rtype}\` | \`${actions}\` |\n`;
+              }
+
+              policySection = `\n\n### 🔄 IAM Policy Auto-Updated\n\n` +
+                `**${allMissing.length} new IAM action(s)** were appended to \`terraform-apply-policy.json\` and committed to this branch.\n\n` +
+                `| Resource Type | Actions Added |\n` +
+                `|---|---|\n` +
+                typesTable +
+                `\n> Reviewers: verify the added permissions are appropriate before approving.`;
+            } else if ('${{ steps.plan.outcome }}' === 'success') {
+              policySection = '\n\n### ⚠️ IAM Policy Check Skipped\n\nCould not run policy coverage check.';
+            }
 
             const output = `### Terraform Plan Result for dev environment [${planStatus}]
 
@@ -138,7 +218,8 @@ jobs:
 
             </details>
 
-            ${isTruncated ? `⚠️ Plan output is too long and has been truncated in this comment. View the full output in workflow run artifacts: ${runUrl}` : ''}
+            ${isTruncated ? `⚠️ Plan output truncated. [View full output](${runUrl})` : ''}
+            ${policySection}
 
             *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`;
 
@@ -148,23 +229,24 @@ jobs:
               issue_number: context.issue.number,
             });
 
-            const botComment = comments.find(comment => {
-              return comment.user.type === 'Bot' && comment.body.includes(`Terraform Plan Result for dev environment`);
-            });
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('Terraform Plan Result for dev environment')
+            );
 
             if (botComment) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 comment_id: botComment.id,
-                body: output
+                body: output,
               });
             } else {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body: output
+                body: output,
               });
             }
 

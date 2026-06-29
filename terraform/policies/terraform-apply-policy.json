@@ -1,0 +1,90 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "TerraformStateS3Access",
+      "Effect": "Allow",
+      "Action": [
+        "s3:*"
+      ],
+      "Resource": [
+        "arn:aws:s3:::*"
+      ]
+    },
+    {
+      "Sid": "TerraformStateLockDynamoDB",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:DeleteItem",
+        "dynamodb:DescribeTable",
+        "dynamodb:GetItem",
+        "dynamodb:PutItem"
+      ],
+      "Resource": "arn:aws:dynamodb:*:*:table/terraform-lock"
+    },
+    {
+      "Sid": "TerraformCoreServices",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:*",
+        "ec2:*",
+        "ecr:*",
+        "ecs:*",
+        "iam:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "TerraformResourceActions",
+      "Effect": "Allow",
+      "Action": [
+        "elasticache:AddTagsToResource",
+        "elasticache:CreateCacheSubnetGroup",
+        "elasticache:CreateReplicationGroup",
+        "elasticache:DeleteCacheSubnetGroup",
+        "elasticache:DeleteReplicationGroup",
+        "elasticache:DescribeCacheSubnetGroups",
+        "elasticache:DescribeReplicationGroups",
+        "elasticache:ListTagsForResource",
+        "elasticache:ModifyCacheSubnetGroup",
+        "elasticache:ModifyReplicationGroup",
+        "elasticloadbalancing:AddTags",
+        "elasticloadbalancing:CreateListener",
+        "elasticloadbalancing:CreateLoadBalancer",
+        "elasticloadbalancing:CreateRule",
+        "elasticloadbalancing:CreateTargetGroup",
+        "elasticloadbalancing:DeleteListener",
+        "elasticloadbalancing:DeleteLoadBalancer",
+        "elasticloadbalancing:DeleteRule",
+        "elasticloadbalancing:DeleteTargetGroup",
+        "elasticloadbalancing:DeregisterTargets",
+        "elasticloadbalancing:DescribeListenerAttributes",
+        "elasticloadbalancing:DescribeListeners",
+        "elasticloadbalancing:DescribeLoadBalancerAttributes",
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeRules",
+        "elasticloadbalancing:DescribeTags",
+        "elasticloadbalancing:DescribeTargetGroupAttributes",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "elasticloadbalancing:ModifyListener",
+        "elasticloadbalancing:ModifyLoadBalancerAttributes",
+        "elasticloadbalancing:ModifyRule",
+        "elasticloadbalancing:ModifyTargetGroup",
+        "elasticloadbalancing:ModifyTargetGroupAttributes",
+        "elasticloadbalancing:RegisterTargets",
+        "elasticloadbalancing:RemoveTags",
+        "logs:AssociateKmsKey",
+        "logs:CreateLogGroup",
+        "logs:DeleteLogGroup",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+        "logs:ListTagsForResource",
+        "logs:ListTagsLogGroup",
+        "logs:PutRetentionPolicy",
+        "logs:TagLogGroup",
+        "logs:UntagLogGroup"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

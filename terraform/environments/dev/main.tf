@@ -128,3 +128,19 @@ module "ecs_websocket" {
   task_cpu    = 256
   task_memory = 512
 }
+
+# ── Valkey ────────────────────────────────────────────────────────────────────
+
+module "valkey" {
+  source = "../../modules/valkey"
+
+  project     = var.project
+  environment = var.environment
+  vpc_id      = module.vpc.vpc_id
+  subnet_ids  = module.vpc.private_subnet_ids
+
+  allowed_security_group_ids = [
+    module.ecs_api.task_security_group_id,
+    module.ecs_websocket.task_security_group_id,
+  ]
+}
