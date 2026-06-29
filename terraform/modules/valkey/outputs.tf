@@ -1,10 +1,10 @@
-output "endpoint" {
+output "primary_endpoint" {
   description = "Valkey primary endpoint hostname"
-  value       = aws_elasticache_cluster.this.cache_nodes[0].address
+  value       = aws_elasticache_replication_group.this.primary_endpoint_address
 }
 
 output "port" {
-  value = aws_elasticache_cluster.this.cache_nodes[0].port
+  value = aws_elasticache_replication_group.this.port
 }
 
 output "security_group_id" {
