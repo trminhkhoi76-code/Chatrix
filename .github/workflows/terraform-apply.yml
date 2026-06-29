@@ -158,11 +158,26 @@ jobs:
 
       - name: Attach Policy to IAM Role
         run: |
+          # Use absolute path — file:// with a relative path can resolve incorrectly
+          POLICY_ABS="${GITHUB_WORKSPACE}/${{ env.POLICY_FILE }}"
+
           aws iam put-role-policy \
             --role-name "${{ env.GITHUB_OIDC_ROLE }}" \
             --policy-name "TerraformApplyInlinePolicy" \
-            --policy-document "file://${{ env.POLICY_FILE }}"
-          echo "Inline policy attached to role ${{ env.GITHUB_OIDC_ROLE }}."
+            --policy-document "file://${POLICY_ABS}"
+
+          # Confirm the write landed before proceeding
+          aws iam get-role-policy \
+            --role-name "${{ env.GITHUB_OIDC_ROLE }}" \
+            --policy-name "TerraformApplyInlinePolicy" \
+            --query 'PolicyDocument' \
+            --output json > /dev/null
+          echo "Policy write confirmed."
+
+          # IAM policy changes propagate eventually — 15s is sufficient for ap-northeast-1
+          echo "Waiting 15s for IAM propagation..."
+          sleep 15
+          echo "Proceeding."
 
       - name: Verify Policy Coverage
         id: verify_policy
