@@ -97,44 +97,6 @@ jobs:
           path: ${{ env.TF_WORKING_DIR }}/${{ steps.plan.outputs.plan_file }}
           retention-days: 14
 
-      # ── IAM Policy Coverage ───────────────────────────────────────────────────
-
-      - name: Export Plan JSON
-        id: plan_json
-        if: steps.plan.outcome == 'success'
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform show -json tfplan > plan.json
-
-      - name: Check IAM Policy Coverage
-        id: policy_check
-        if: steps.plan_json.outcome == 'success'
-        run: |
-          python3 .github/scripts/parse_new_resources.py \
-            ${{ env.TF_WORKING_DIR }}/plan.json \
-            ${{ env.POLICY_FILE }} \
-            > policy_analysis.json
-          MISSING_COUNT=$(jq '.all_missing | length' policy_analysis.json)
-          echo "missing_count=$MISSING_COUNT" >> "$GITHUB_OUTPUT"
-          echo "--- Policy analysis ---"
-          cat policy_analysis.json
-
-      - name: Update IAM Policy File
-        id: policy_update
-        if: steps.policy_check.outcome == 'success' && steps.policy_check.outputs.missing_count != '0'
-        run: |
-          python3 .github/scripts/update_policy.py \
-            ${{ env.POLICY_FILE }} \
-            policy_analysis.json
-
-      - name: Commit and Push Policy Update
-        if: steps.policy_update.outcome == 'success'
-        run: |
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config user.name "github-actions[bot]"
-          git add ${{ env.POLICY_FILE }}
-          git diff --cached --quiet || git commit -m "ci: auto-update IAM policy for new Terraform resources [skip ci]"
-          git push origin HEAD:${{ github.head_ref }}
-
       # ── PR Comment ────────────────────────────────────────────────────────────
 
       - name: Comment PR with Plan Result
@@ -177,36 +139,6 @@ jobs:
               ? planOutput.substring(0, maxLength) + '\n\n... (truncated)'
               : planOutput;
 
-            // Build IAM policy section
-            let policySection = '';
-            const missingCount = '${{ steps.policy_check.outputs.missing_count }}';
-            if (missingCount === '0') {
-              policySection = '\n\n### ✅ IAM Policy Coverage\n\nAll required IAM actions are already present in `terraform-apply-policy.json`.';
-            } else if (missingCount !== '' && missingCount !== '0') {
-              let analysisJson = {};
-              try {
-                analysisJson = JSON.parse(fs.readFileSync('policy_analysis.json', 'utf8'));
-              } catch (_) {}
-
-              const affectedTypes = (analysisJson.affected_types || []).filter(t => analysisJson.missing && analysisJson.missing[t]);
-              const allMissing = analysisJson.all_missing || [];
-
-              let typesTable = '';
-              for (const rtype of affectedTypes) {
-                const actions = (analysisJson.missing[rtype] || []).join(', ');
-                typesTable += `| \`${rtype}\` | \`${actions}\` |\n`;
-              }
-
-              policySection = `\n\n### 🔄 IAM Policy Auto-Updated\n\n` +
-                `**${allMissing.length} new IAM action(s)** were appended to \`terraform-apply-policy.json\` and committed to this branch.\n\n` +
-                `| Resource Type | Actions Added |\n` +
-                `|---|---|\n` +
-                typesTable +
-                `\n> Reviewers: verify the added permissions are appropriate before approving.`;
-            } else if ('${{ steps.plan.outcome }}' === 'success') {
-              policySection = '\n\n### ⚠️ IAM Policy Check Skipped\n\nCould not run policy coverage check.';
-            }
-
             const output = `### Terraform Plan Result for dev environment [${planStatus}]
 
             <details>
@@ -219,7 +151,6 @@ jobs:
             </details>
 
             ${isTruncated ? `⚠️ Plan output truncated. [View full output](${runUrl})` : ''}
-            ${policySection}
 
             *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`;
 
