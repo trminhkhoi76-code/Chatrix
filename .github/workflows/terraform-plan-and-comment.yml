@@ -1,0 +1,360 @@
+name: Terraform Plan and Comment
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches:
+      - 'feature/**'
+      - develop
+      - master
+    paths:
+      - terraform/**
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: ap-northeast-1
+  GITHUB_OIDC_ROLE: Chatrix-GithubAction
+  DEV_AWS_ACCOUNT_ID: 151062089420
+  # TODO: replace with the real prod account id before enabling release/hotfix -> master plans.
+  PROD_AWS_ACCOUNT_ID: 151062089420
+  TF_VERSION: 1.11.4
+  TF_DIR: terraform
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan
+    if: |
+      (startsWith(github.event.pull_request.base.ref, 'feature/') && startsWith(github.head_ref, 'feature/')) ||
+      (github.event.pull_request.base.ref == 'develop' && (startsWith(github.head_ref, 'feature/') || startsWith(github.head_ref, 'hotfix/'))) ||
+      (github.event.pull_request.base.ref == 'master' && (startsWith(github.head_ref, 'release/') || startsWith(github.head_ref, 'hotfix/')))
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) Checkout
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4
+
+      # 2) Setup Terraform
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@651471c36a6092792c552e8b1bef71e592b462d8  # v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # 3) Resolve env/account from branch
+      - name: Resolve environment/account by branch
+        id: resolve
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [[ ("$BASE_REF" =~ ^feature/ || "$BASE_REF" == "develop") && ("$HEAD_REF" =~ ^feature/ || "$HEAD_REF" =~ ^hotfix/) ]]; then
+            echo "tf_env=dev" >> "$GITHUB_OUTPUT"
+            echo "aws_account_id=${{ env.DEV_AWS_ACCOUNT_ID }}" >> "$GITHUB_OUTPUT"
+          elif [[ "$BASE_REF" == "master" && ( "$HEAD_REF" =~ ^release/ || "$HEAD_REF" =~ ^hotfix/ ) ]]; then
+            echo "tf_env=prod" >> "$GITHUB_OUTPUT"
+            echo "aws_account_id=${{ env.PROD_AWS_ACCOUNT_ID }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unsupported branch mapping: BASE_REF=$BASE_REF, HEAD_REF=$HEAD_REF" >&2
+            exit 1
+          fi
+
+      # 4) Configure AWS OIDC
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4
+        with:
+          role-to-assume: arn:aws:iam::${{ steps.resolve.outputs.aws_account_id }}:role/${{ env.GITHUB_OIDC_ROLE }}
+          role-duration-seconds: 900
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 5) Terraform init
+      - name: Terraform Init
+        id: init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          INIT_LOG="init_error_pr${{ github.event.pull_request.number }}_run${{ github.run_id }}.log"
+          echo "init_log=$INIT_LOG" >> "$GITHUB_OUTPUT"
+
+          terraform init -no-color 2>&1 | tee "$INIT_LOG"
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            terraform workspace select -or-create "${{ steps.resolve.outputs.tf_env }}" 2>&1 | tee -a "$INIT_LOG"
+            EXIT_CODE=${PIPESTATUS[0]}
+          fi
+
+          echo "init_exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Terraform Init Debug
+        if: steps.init.outcome == 'failure'
+        run: |
+          echo "::error::Terraform Init Failed"
+          echo "Working directory: ${{ env.TF_DIR }}"
+          ls -la ${{ env.TF_DIR }}
+
+      # 6) Terraform validate
+      - name: Terraform Validate
+        id: validate
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          VALIDATE_LOG="validate_error_pr${{ github.event.pull_request.number }}_run${{ github.run_id }}.log"
+          echo "validate_log=$VALIDATE_LOG" >> "$GITHUB_OUTPUT"
+
+          terraform validate -no-color 2>&1 | tee "$VALIDATE_LOG"
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "validate_exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Terraform Validate Debug
+        if: steps.validate.outcome == 'failure'
+        run: |
+          echo "::error::Terraform Validate Failed"
+          cd ${{ env.TF_DIR }}
+          terraform validate
+
+      # 6.5) Gate: Fail if init or validate failed
+      - name: Check Init and Validate Status
+        if: steps.init.outcome == 'failure' || steps.validate.outcome == 'failure'
+        run: |
+          echo "::error::Terraform init or validate failed"
+          exit 1
+
+      # 7) Terraform plan
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_DIR }}
+        continue-on-error: true
+        run: |
+          PLAN_FILE="plan_output_pr${{ github.event.pull_request.number }}_run${{ github.run_id }}.txt"
+          PLAN_LOG="plan_error_pr${{ github.event.pull_request.number }}_run${{ github.run_id }}.log"
+
+          echo "plan_log=$PLAN_LOG" >> "$GITHUB_OUTPUT"
+
+          # Avoid shell pipe/wrapper edge cases so exit_code is always accurate (0/2/1).
+          set +e
+          terraform plan -no-color -detailed-exitcode -out=tfplan > "$PLAN_LOG" 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          cat "$PLAN_LOG"
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ $EXIT_CODE -eq 1 ]; then
+            # Keep only error log on plan failure
+            exit 1
+          fi
+
+          # For exit code 0/2, export rendered plan
+          echo "plan_file=$PLAN_FILE" >> "$GITHUB_OUTPUT"
+          terraform show -no-color tfplan > "$PLAN_FILE"
+
+      # 8) Upload plan/log artifact
+      - name: Upload full plan artifact
+        if: always() && steps.resolve.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-pr${{ github.event.pull_request.number }}-${{ steps.resolve.outputs.tf_env }}-${{ github.run_id }}
+          path: |
+            ${{ env.TF_DIR }}/${{ steps.init.outputs.init_log }}
+            ${{ env.TF_DIR }}/${{ steps.validate.outputs.validate_log }}
+            ${{ env.TF_DIR }}/${{ steps.plan.outputs.plan_file }}
+            ${{ env.TF_DIR }}/${{ steps.plan.outputs.plan_log }}
+          if-no-files-found: warn
+          retention-days: 14
+
+       # 9) Comment on PR with plan output
+      - name: Comment PR with Plan Result
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+            github-token: ${{ secrets.GITHUB_TOKEN }}
+            script: |
+             const fs = require('fs');
+             const path = require('path');
+             const environment = '${{ steps.resolve.outputs.tf_env }}';
+             const initLog = '${{ steps.init.outputs.init_log }}';
+             const validateLog = '${{ steps.validate.outputs.validate_log }}';
+             const planFile = '${{ steps.plan.outputs.plan_file }}';
+             const planLog = '${{ steps.plan.outputs.plan_log }}';
+             const initOutcome = '${{ steps.init.outcome }}';
+             const validateOutcome = '${{ steps.validate.outcome }}';
+             const planOutcome = '${{ steps.plan.outcome }}';
+             const rawExitCode = '${{ steps.plan.outputs.exit_code }}';
+             const parsedExitCode = Number.parseInt(rawExitCode, 10);
+             const exitCode = Number.isNaN(parsedExitCode) ? -1 : parsedExitCode;
+             const planDir = '${{ env.TF_DIR }}';
+             const initLogPath = path.join(planDir, initLog);
+             const validateLogPath = path.join(planDir, validateLog);
+             const planPath = path.join(planDir, planFile);
+             const planLogPath = path.join(planDir, planLog);
+             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+             let planOutput = '';
+             let planStatus = '❌ Failed';
+             let initStatus = initOutcome === 'success' ? '✅' : '❌';
+             let validateStatus = validateOutcome === 'success' ? '✅' : '❌';
+             let planStatus_step = planOutcome === 'success' ? '✅' : '❌';
+
+             function readLogFile(logPath, fallbackMessage) {
+               if (!logPath || !fs.existsSync(logPath)) {
+                 return fallbackMessage;
+               }
+
+               try {
+                 return fs.readFileSync(logPath, 'utf8');
+               } catch (err) {
+                 return `Error reading log file: ${err.message}`;
+               }
+             }
+
+             // Determine plan status based on terraform exit code
+             if (initOutcome === 'failure' || validateOutcome === 'failure') {
+               planStatus = '❌ Failed (Init/Validate)';
+               const sections = [];
+
+               if (initOutcome === 'failure') {
+                 const initError = readLogFile(
+                   initLogPath,
+                   'Terraform init failed, but init log file was not found. Check workflow logs.'
+                 );
+                 sections.push(`--- INIT ERROR ---\n${initError}`);
+               }
+
+               if (validateOutcome === 'failure') {
+                 const validateError = readLogFile(
+                   validateLogPath,
+                   'Terraform validate failed, but validate log file was not found. Check workflow logs.'
+                 );
+                 sections.push(`--- VALIDATE ERROR ---\n${validateError}`);
+               }
+
+               planOutput = sections.join('\n\n');
+             } else if (planOutcome === 'failure') {
+               planStatus = '❌ Failed';
+               // If plan failed, try to read error log
+               if (planLog && fs.existsSync(planLogPath)) {
+                 try {
+                   planOutput = fs.readFileSync(planLogPath, 'utf8');
+                   console.log('Error log file found and read successfully');
+                 } catch (err) {
+                   console.error('Error reading log file:', err);
+                   planOutput = `Error reading log file: ${err.message}`;
+                 }
+               } else {
+                 planOutput = 'Failed to run terraform plan. Check error logs in artifacts.';
+               }
+             } else if (planOutcome === 'success') {
+               // exit_code 0 = no changes, 2 = has changes
+               if (exitCode === 0) {
+                 planStatus = '✅ No changes';
+                 planOutput = 'Terraform plan completed with no changes.';
+               } else if (exitCode === 2) {
+                 planStatus = '⚠️ Changes detected';
+                 // Try to read plan output file
+                 if (planFile && fs.existsSync(planPath)) {
+                   try {
+                     const stats = fs.statSync(planPath);
+                     if (stats.isFile()) {
+                       planOutput = fs.readFileSync(planPath, 'utf8');
+                     }
+                   } catch (err) {
+                     console.error('Error reading plan file:', err);
+                     planOutput = `Error reading plan file: ${err.message}`;
+                   }
+                 } else {
+                   planOutput = `Plan file not found at: ${planPath}`;
+                 }
+               } else {
+                 planStatus = '❓ Unknown';
+                 planOutput = `Unexpected exit code: ${exitCode}`;
+               }
+             } else {
+               planStatus = '❌ Failed';
+               planOutput = 'Plan file output not available (likely due to init/validation failure)';
+             }
+
+             const maxLength = 65000;
+             const isTruncated = planOutput.length > maxLength;
+             const truncatedPlan = isTruncated
+               ? planOutput.substring(0, maxLength) + '\n\n... (truncated)'
+               : planOutput;
+             const isFailure = planStatus.startsWith('❌');
+             const errorPreviewLineLimit = 35;
+             const errorPreview = isFailure
+               ? truncatedPlan.split('\n').slice(0, errorPreviewLineLimit).join('\n')
+               : '';
+
+             const commentTag = `Terraform Plan Result for \`${environment}\` environment`;
+             const output = `### ${commentTag} [${planStatus}]
+
+             **Step Status:**
+             - Init: ${initStatus}
+             - Validate: ${validateStatus}
+             - Plan: ${planStatus_step}
+             - Exit Code: ${exitCode}
+
+             ${isFailure ? `**Error Preview (first ${errorPreviewLineLimit} lines):**
+
+             \`\`\`terraform
+             ${errorPreview}
+             \`\`\`` : ''}
+
+             <details>
+             <summary>Show Plan/Errors</summary>
+
+             \`\`\`terraform
+             ${truncatedPlan}
+             \`\`\`
+
+             </details>
+
+             ${isTruncated ? `⚠️ Output is too long and has been truncated in this comment. View the full output in workflow run artifacts: ${runUrl}` : ''}
+
+             *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+             const { data: comments } = await github.rest.issues.listComments({
+               owner: context.repo.owner,
+               repo: context.repo.repo,
+               issue_number: context.issue.number,
+             });
+
+             const botComment = comments.find(comment =>
+               comment.user.type === 'Bot' && comment.body.includes(commentTag)
+             );
+
+             if (botComment) {
+               await github.rest.issues.updateComment({
+                 owner: context.repo.owner,
+                 repo: context.repo.repo,
+                 comment_id: botComment.id,
+                 body: output
+               });
+             } else {
+               await github.rest.issues.createComment({
+                 owner: context.repo.owner,
+                 repo: context.repo.repo,
+                 issue_number: context.issue.number,
+                 body: output
+               });
+             }
+
+      # 10) Fail workflow if plan failed
+      - name: Terraform Plan Status Check
+        if: steps.plan.outcome == 'failure'
+        run: |
+          echo "::error::Terraform plan failed. Check PR comment and workflow logs for details."
+          exit 1
