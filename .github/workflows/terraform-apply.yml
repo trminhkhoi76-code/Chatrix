@@ -1,0 +1,518 @@
+name: Terraform Apply Chatrix Infra
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - develop
+      - master
+    paths:
+      - terraform/**
+      - .github/workflows/terraform-apply.yml
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: ap-northeast-1
+  GITHUB_OIDC_ROLE: Chatrix-GithubAction
+  # Least-privilege role (iam:PutRolePolicy / iam:GetRolePolicy only) assumed solely to
+  # attach permissions the plan discovered are missing from Chatrix-GithubAction.
+  GITHUB_OIDC_ROLE_PUT_POLICY: Chatrix-PolicyManager
+  DEV_AWS_ACCOUNT_ID: 151062089420
+  # TODO: replace with the real prod account id before enabling master deploys.
+  PROD_AWS_ACCOUNT_ID: 151062089420
+  TF_VERSION: 1.11.4
+  TF_DIR: terraform
+
+jobs:
+  resolve-environment:
+    name: "Resolve Environment"
+    # Only run when the PR is actually merged (not just closed), the source branch lives in
+    # this repository (never a fork), and the branch naming matches:
+    #   develop <- feature/* hotfix/*  (dev)
+    #   master  <- release/* hotfix/*  (prod)
+    if: |
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository && (
+        (github.event.pull_request.base.ref == 'develop' && (startsWith(github.head_ref, 'feature/') || startsWith(github.head_ref, 'hotfix/'))) ||
+        (github.event.pull_request.base.ref == 'master' && (startsWith(github.head_ref, 'release/') || startsWith(github.head_ref, 'hotfix/')))
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      account_id: ${{ steps.resolve.outputs.account_id }}
+      environment: ${{ steps.resolve.outputs.environment }}
+    steps:
+      - name: Resolve AWS account and environment
+        id: resolve
+        shell: bash
+        run: |
+          if [[ "${{ github.event.pull_request.base.ref }}" == "master" ]]; then
+            echo "account_id=${{ env.PROD_AWS_ACCOUNT_ID }}" >> "$GITHUB_OUTPUT"
+            echo "environment=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "account_id=${{ env.DEV_AWS_ACCOUNT_ID }}" >> "$GITHUB_OUTPUT"
+            echo "environment=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Hand off the merge commit SHA + resolved environment/account to the downstream
+      # Build and Deploy workflow, which is triggered via workflow_run and therefore has
+      # no direct access to this run's pull_request context.
+      - name: Write deploy context
+        run: |
+          {
+            echo "{"
+            echo "  \"sha\": \"${{ github.sha }}\","
+            echo "  \"environment\": \"${{ steps.resolve.outputs.environment }}\","
+            echo "  \"account_id\": \"${{ steps.resolve.outputs.account_id }}\""
+            echo "}"
+          } > deploy-context.json
+          cat deploy-context.json
+
+      - name: Upload deploy context
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-apply-context-${{ github.run_id }}
+          path: deploy-context.json
+          retention-days: 1
+
+  detect-changes:
+    name: "Detect Changes"
+    needs: resolve-environment
+    if: needs.resolve-environment.result == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      terraform_changed: ${{ steps.filter.outputs.terraform }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4
+
+      - name: Detect changed paths
+        id: filter
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36  # v3
+        with:
+          filters: |
+            terraform:
+              - 'terraform/**'
+
+  terraform-plan:
+    name: "Terraform Plan"
+    needs:
+      - resolve-environment
+      - detect-changes
+    if: needs.detect-changes.outputs.terraform_changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+      has_missing: ${{ steps.detect.outputs.has_missing }}
+      missing_services: ${{ steps.detect.outputs.missing_services }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@651471c36a6092792c552e8b1bef71e592b462d8  # v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4
+        with:
+          role-to-assume: arn:aws:iam::${{ needs.resolve-environment.outputs.account_id }}:role/${{ env.GITHUB_OIDC_ROLE }}
+          role-duration-seconds: 900
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init
+          terraform workspace select -or-create "${{ needs.resolve-environment.outputs.environment }}"
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_DIR }}
+        shell: bash
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -no-color -out=tfplan
+          PLAN_EXIT=$?
+          set -e
+
+          if [ $PLAN_EXIT -eq 1 ]; then
+            echo "Terraform plan failed"
+            exit 1
+          fi
+
+          if [ $PLAN_EXIT -eq 2 ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            terraform show -no-color tfplan > plan_output.txt
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            touch plan_output.txt
+          fi
+
+      # Parse the plan text and find services not covered by terraform-deploy-policy.json
+      - name: Detect Missing Policies
+        id: detect
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          PLAN_FILE="plan_output.txt"
+
+          if [ "${{ steps.plan.outputs.has_changes }}" != "true" ] || ! [ -s "$PLAN_FILE" ]; then
+            echo "No infrastructure changes — no policy check needed"
+            echo "has_missing=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "=== Analyzing: $PLAN_FILE ==="
+
+          # Extract all Terraform resource types present in the plan
+          RESOURCE_TYPES=$(grep -oP '(?<=resource ")[^"]+' "$PLAN_FILE" | sort -u)
+          echo "=== Resource types in plan ==="
+          echo "$RESOURCE_TYPES"
+
+          # Extract IAM service prefixes already covered by the existing policy
+          EXISTING_SERVICES=$(jq -r '
+            [.Statement[].Action | if type == "array" then .[] else . end]
+            | .[] | split(":")[0]
+          ' "$GITHUB_WORKSPACE/.github/iam/terraform-deploy-policy.json" | sort -u)
+          echo "=== Existing IAM service prefixes in policy ==="
+          echo "$EXISTING_SERVICES"
+
+          # Map Terraform resource type prefix -> IAM service prefix
+          get_service() {
+            case "$1" in
+              aws_ecs_*)                                                                       echo "ecs" ;;
+              aws_ecr_*)                                                                       echo "ecr" ;;
+              aws_sqs_*)                                                                       echo "sqs" ;;
+              aws_iam_*)                                                                       echo "iam" ;;
+              aws_cloudwatch_log_group*|aws_cloudwatch_log_*)                                  echo "logs" ;;
+              aws_cloudwatch_*)                                                                echo "cloudwatch" ;;
+              aws_lb_*|aws_alb_*)                                                              echo "elasticloadbalancing" ;;
+              aws_s3_*)                                                                        echo "s3" ;;
+              aws_lambda_*)                                                                    echo "lambda" ;;
+              aws_rds_*|aws_db_*)                                                              echo "rds" ;;
+              aws_elasticache_*)                                                               echo "elasticache" ;;
+              aws_security_group*|aws_vpc_*|aws_subnet_*|aws_route*|aws_internet_gateway*|aws_nat_gateway*) echo "ec2" ;;
+              aws_appautoscaling_*)                                                            echo "application-autoscaling" ;;
+              aws_ssm_*)                                                                       echo "ssm" ;;
+              aws_secretsmanager_*)                                                            echo "secretsmanager" ;;
+              aws_dynamodb_*)                                                                  echo "dynamodb" ;;
+              aws_kinesis_*)                                                                   echo "kinesis" ;;
+              aws_sns_*)                                                                       echo "sns" ;;
+              aws_api_gateway*|aws_apigatewayv2_*)                                             echo "apigateway" ;;
+              aws_cognito_*)                                                                   echo "cognito-idp" ;;
+              aws_wafv2_*)                                                                     echo "wafv2" ;;
+              aws_acm_*)                                                                       echo "acm" ;;
+              aws_route53_*)                                                                   echo "route53" ;;
+              aws_ses_*)                                                                       echo "ses" ;;
+              aws_sfn_*)                                                                       echo "states" ;;
+              aws_glue_*)                                                                      echo "glue" ;;
+              *)                                                                               echo "" ;;
+            esac
+          }
+
+          MISSING_SERVICES=""
+          while IFS= read -r resource_type; do
+            [ -z "$resource_type" ] && continue
+            SERVICE=$(get_service "$resource_type")
+            [ -z "$SERVICE" ] && continue
+            if ! echo "$EXISTING_SERVICES" | grep -qx "$SERVICE"; then
+              echo "MISSING: $resource_type -> $SERVICE"
+              MISSING_SERVICES="$MISSING_SERVICES $SERVICE"
+            fi
+          done <<< "$RESOURCE_TYPES"
+
+          MISSING_SERVICES=$(echo "$MISSING_SERVICES" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ' | xargs)
+
+          if [ -z "$MISSING_SERVICES" ]; then
+            echo "All services in the plan are covered by the existing policy"
+            echo "has_missing=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Missing services: $MISSING_SERVICES"
+            echo "has_missing=true" >> "$GITHUB_OUTPUT"
+            echo "missing_services=$MISSING_SERVICES" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Build a minimal IAM policy document for each missing service
+      - name: Generate Missing Policy Document
+        if: steps.detect.outputs.has_missing == 'true'
+        env:
+          MISSING_SERVICES: ${{ steps.detect.outputs.missing_services }}
+        run: |
+          # Returns a single-line JSON policy statement for the given IAM service.
+          # Actions are scoped to what Terraform typically needs to manage resources of that type.
+          get_statement() {
+            case "$1" in
+              sqs)
+                echo '{"Sid":"SQSManage","Effect":"Allow","Action":["sqs:CreateQueue","sqs:DeleteQueue","sqs:GetQueueAttributes","sqs:SetQueueAttributes","sqs:ListQueues","sqs:TagQueue","sqs:UntagQueue","sqs:ListQueueTags","sqs:SendMessage","sqs:ReceiveMessage","sqs:DeleteMessage","sqs:PurgeQueue"],"Resource":"*"}'
+                ;;
+              ssm)
+                echo '{"Sid":"SSMManage","Effect":"Allow","Action":["ssm:GetParameter","ssm:GetParameters","ssm:GetParametersByPath","ssm:PutParameter","ssm:DeleteParameter","ssm:AddTagsToResource","ssm:ListTagsForResource","ssm:DescribeParameters"],"Resource":"*"}'
+                ;;
+              secretsmanager)
+                echo '{"Sid":"SecretsManagerManage","Effect":"Allow","Action":["secretsmanager:CreateSecret","secretsmanager:DeleteSecret","secretsmanager:GetSecretValue","secretsmanager:PutSecretValue","secretsmanager:UpdateSecret","secretsmanager:DescribeSecret","secretsmanager:TagResource","secretsmanager:UntagResource","secretsmanager:ListSecrets"],"Resource":"*"}'
+                ;;
+              lambda)
+                echo '{"Sid":"LambdaManage","Effect":"Allow","Action":["lambda:CreateFunction","lambda:DeleteFunction","lambda:GetFunction","lambda:UpdateFunctionCode","lambda:UpdateFunctionConfiguration","lambda:ListFunctions","lambda:AddPermission","lambda:RemovePermission","lambda:GetPolicy","lambda:TagResource","lambda:UntagResource","lambda:ListTags"],"Resource":"*"}'
+                ;;
+              rds)
+                echo '{"Sid":"RDSManage","Effect":"Allow","Action":["rds:CreateDBInstance","rds:DeleteDBInstance","rds:DescribeDBInstances","rds:ModifyDBInstance","rds:CreateDBSubnetGroup","rds:DeleteDBSubnetGroup","rds:DescribeDBSubnetGroups","rds:AddTagsToResource","rds:RemoveTagsFromResource","rds:ListTagsForResource"],"Resource":"*"}'
+                ;;
+              elasticache)
+                echo '{"Sid":"ElastiCacheManage","Effect":"Allow","Action":["elasticache:CreateReplicationGroup","elasticache:DeleteReplicationGroup","elasticache:DescribeReplicationGroups","elasticache:ModifyReplicationGroup","elasticache:CreateCacheSubnetGroup","elasticache:DeleteCacheSubnetGroup","elasticache:DescribeCacheClusters","elasticache:AddTagsToResource","elasticache:RemoveTagsFromResource","elasticache:ListTagsForResource"],"Resource":"*"}'
+                ;;
+              s3)
+                echo '{"Sid":"S3Manage","Effect":"Allow","Action":["s3:CreateBucket","s3:DeleteBucket","s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:HeadObject","s3:HeadBucket","s3:GetBucketPolicy","s3:PutBucketPolicy","s3:DeleteBucketPolicy","s3:GetBucketVersioning","s3:PutBucketVersioning","s3:GetBucketTagging","s3:PutBucketTagging","s3:GetLifecycleConfiguration","s3:PutLifecycleConfiguration"],"Resource":"*"}'
+                ;;
+              dynamodb)
+                echo '{"Sid":"DynamoDBManage","Effect":"Allow","Action":["dynamodb:CreateTable","dynamodb:DeleteTable","dynamodb:DescribeTable","dynamodb:UpdateTable","dynamodb:TagResource","dynamodb:UntagResource","dynamodb:ListTagsOfResource","dynamodb:DescribeTimeToLive","dynamodb:UpdateTimeToLive"],"Resource":"*"}'
+                ;;
+              sns)
+                echo '{"Sid":"SNSManage","Effect":"Allow","Action":["sns:CreateTopic","sns:DeleteTopic","sns:GetTopicAttributes","sns:SetTopicAttributes","sns:Subscribe","sns:Unsubscribe","sns:ListTopics","sns:TagResource","sns:UntagResource","sns:ListTagsForResource"],"Resource":"*"}'
+                ;;
+              route53)
+                echo '{"Sid":"Route53Manage","Effect":"Allow","Action":["route53:ChangeResourceRecordSets","route53:GetHostedZone","route53:ListHostedZones","route53:ListResourceRecordSets","route53:CreateHostedZone","route53:DeleteHostedZone","route53:ChangeTagsForResource"],"Resource":"*"}'
+                ;;
+              acm)
+                echo '{"Sid":"ACMManage","Effect":"Allow","Action":["acm:RequestCertificate","acm:DeleteCertificate","acm:DescribeCertificate","acm:GetCertificate","acm:ListCertificates","acm:AddTagsToCertificate","acm:RemoveTagsFromCertificate","acm:ListTagsForCertificate"],"Resource":"*"}'
+                ;;
+              cognito-idp)
+                echo '{"Sid":"CognitoManage","Effect":"Allow","Action":["cognito-idp:CreateUserPool","cognito-idp:DeleteUserPool","cognito-idp:DescribeUserPool","cognito-idp:UpdateUserPool","cognito-idp:CreateUserPoolClient","cognito-idp:DeleteUserPoolClient","cognito-idp:TagResource","cognito-idp:UntagResource","cognito-idp:ListTagsForResource"],"Resource":"*"}'
+                ;;
+              *)
+                SID=$(echo "AutoAdded_${1}" | tr '-' '_')
+                echo "{\"Sid\":\"${SID}\",\"Effect\":\"Allow\",\"Action\":[\"${1}:Describe*\",\"${1}:List*\",\"${1}:Get*\"],\"Resource\":\"*\"}"
+                ;;
+            esac
+          }
+
+          STATEMENTS="[]"
+          for svc in $MISSING_SERVICES; do
+            STMT=$(get_statement "$svc")
+            STATEMENTS=$(echo "$STATEMENTS" | jq --argjson s "$STMT" '. + [$s]')
+          done
+
+          POLICY_DOC=$(jq -n --argjson stmts "$STATEMENTS" '{"Version":"2012-10-17","Statement":$stmts}')
+
+          echo "=== Generated policy document ==="
+          echo "$POLICY_DOC" | jq .
+
+          mkdir -p "$GITHUB_WORKSPACE/ci-artifacts"
+          echo "$POLICY_DOC" > "$GITHUB_WORKSPACE/ci-artifacts/missing-policy.json"
+
+      - name: Stage plan artifacts
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/ci-artifacts"
+          cp "${{ env.TF_DIR }}/tfplan" "$GITHUB_WORKSPACE/ci-artifacts/tfplan" 2>/dev/null || true
+
+      - name: Upload plan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: ci-artifacts/
+          if-no-files-found: ignore
+          retention-days: 1
+
+  attach-missing-policies:
+    name: "Attach Missing Policies"
+    needs:
+      - resolve-environment
+      - terraform-plan
+    if: needs.terraform-plan.outputs.has_missing == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download plan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: ci-artifacts
+
+      # Assume a role scoped to iam:PutRolePolicy/iam:GetRolePolicy only — never the main
+      # Chatrix-GithubAction role — to attach the permissions the plan is missing.
+      - name: Configure AWS credentials (Policy Manager role)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4
+        with:
+          role-to-assume: arn:aws:iam::${{ needs.resolve-environment.outputs.account_id }}:role/${{ env.GITHUB_OIDC_ROLE_PUT_POLICY }}
+          role-duration-seconds: 900
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Attach Missing Policies to GitHub Actions Role
+        id: attach
+        env:
+          MISSING_SERVICES: ${{ needs.terraform-plan.outputs.missing_services }}
+        run: |
+          POLICY_NAME="terraform-auto-missing-permissions"
+          ROLE_NAME="${{ env.GITHUB_OIDC_ROLE }}"
+
+          aws iam put-role-policy \
+            --role-name "$ROLE_NAME" \
+            --policy-name "$POLICY_NAME" \
+            --policy-document "$(cat ci-artifacts/missing-policy.json)"
+
+          echo "Attached inline policy '$POLICY_NAME' to role '$ROLE_NAME'"
+          echo "Permissions added for: $MISSING_SERVICES"
+
+      # IAM writes are read-after-write consistent for GetRolePolicy, but the permissions
+      # can take a few seconds to become effective for the *next* job's assumed session.
+      # Poll until the live policy actually contains everything we just wrote.
+      - name: Verify Policy Propagation
+        run: |
+          ROLE_NAME="${{ env.GITHUB_OIDC_ROLE }}"
+          POLICY_NAME="terraform-auto-missing-permissions"
+          MAX_ATTEMPTS=6
+          SLEEP_SECONDS=5
+
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "Attempt $attempt/$MAX_ATTEMPTS: checking inline policy '$POLICY_NAME' on role '$ROLE_NAME'"
+            REMOTE_DOC=$(aws iam get-role-policy --role-name "$ROLE_NAME" --policy-name "$POLICY_NAME" --query 'PolicyDocument' --output json 2>/dev/null || echo "")
+
+            if [ -n "$REMOTE_DOC" ]; then
+              WANT=$(jq '[.Statement[].Action] | flatten | sort' ci-artifacts/missing-policy.json)
+              HAVE=$(echo "$REMOTE_DOC" | jq '[.Statement[].Action] | flatten | sort')
+              STILL_MISSING=$(jq -n --argjson want "$WANT" --argjson have "$HAVE" '$want - $have')
+
+              if [ "$(echo "$STILL_MISSING" | jq 'length')" -eq 0 ]; then
+                echo "All expected actions are present on the live role policy"
+                exit 0
+              fi
+            fi
+
+            echo "Policy not yet fully propagated, waiting ${SLEEP_SECONDS}s..."
+            sleep $SLEEP_SECONDS
+          done
+
+          echo "::error::Policy attachment did not propagate after $((MAX_ATTEMPTS * SLEEP_SECONDS))s"
+          exit 1
+
+      - name: Comment on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const missingServices = '${{ needs.terraform-plan.outputs.missing_services }}';
+            const environment = '${{ needs.resolve-environment.outputs.environment }}';
+            const outcome = '${{ job.status }}';
+            const ok = outcome === 'success';
+            const commentTag = `<!-- auto-attach-missing-policies -->`;
+
+            const body = `${commentTag}
+            ### ${ok ? '✅' : '❌'} Policy Check: Missing Permissions ${ok ? 'Auto-Attached' : 'Detected — Action Required'}
+
+            The Terraform plan for \`${environment}\` required IAM permissions for services not covered by the current policy.
+
+            **Missing services:** \`${missingServices}\`
+
+            **Status:** ${ok
+                ? 'Inline policy `terraform-auto-missing-permissions` was attached to `Chatrix-GithubAction` and verified before apply.'
+                : 'Failed to attach or verify the policy — Terraform Apply was blocked. Check workflow logs and attach permissions manually.'}
+
+            > ⚠️ Review these permissions and incorporate them into \`.github/iam/terraform-deploy-policy.json\`.
+
+            *Auto-applied by Terraform Apply Chatrix Infra workflow*`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+
+            const existing = comments.find(c => c.body.includes(commentTag));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body,
+              });
+            }
+
+  terraform-apply:
+    name: "Terraform Apply"
+    needs:
+      - resolve-environment
+      - terraform-plan
+      - attach-missing-policies
+    if: |
+      always() &&
+      needs.terraform-plan.result == 'success' &&
+      needs.terraform-plan.outputs.has_changes == 'true' &&
+      (needs.attach-missing-policies.result == 'success' || needs.attach-missing-policies.result == 'skipped')
+    concurrency:
+      group: terraform-${{ needs.resolve-environment.outputs.environment }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@651471c36a6092792c552e8b1bef71e592b462d8  # v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4
+        with:
+          role-to-assume: arn:aws:iam::${{ needs.resolve-environment.outputs.account_id }}:role/${{ env.GITHUB_OIDC_ROLE }}
+          role-duration-seconds: 1800
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init
+          terraform workspace select -or-create "${{ needs.resolve-environment.outputs.environment }}"
+
+      - name: Download plan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: ci-artifacts
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -auto-approve "$GITHUB_WORKSPACE/ci-artifacts/tfplan"
+
+      - name: Apply Summary
+        if: always()
+        run: |
+          {
+            echo "## Terraform Apply Summary"
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Result | ${{ job.status }} |"
+            echo "| Environment | ${{ needs.resolve-environment.outputs.environment }} |"
+            echo "| AWS Account ID | ${{ needs.resolve-environment.outputs.account_id }} |"
+            echo "| Missing policies attached | ${{ needs.attach-missing-policies.result == 'success' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

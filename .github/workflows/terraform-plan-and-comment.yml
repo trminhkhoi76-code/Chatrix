@@ -1,0 +1,559 @@
+name: Terraform Plan and Comment
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches:
+      - 'feature/**'
+      - develop
+      - main
+    paths:
+      - terraform/**
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+env:
+  AWS_REGION: ap-northeast-1
+  GITHUB_OIDC_ROLE: Chatrix-GithubAction
+  DEV_AWS_ACCOUNT_ID: 151062089420
+  # TODO: replace with the real prod account id before enabling release/hotfix -> master plans.
+  PROD_AWS_ACCOUNT_ID: 151062089420
+  TF_VERSION: 1.11.4
+  TF_DIR: terraform
+  POLICY_FILE: .github/iam/terraform-deploy-policy.json
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan
+    if: |
+      (startsWith(github.event.pull_request.base.ref, 'feature/') && startsWith(github.head_ref, 'feature/')) ||
+      (github.event.pull_request.base.ref == 'develop' && (startsWith(github.head_ref, 'feature/') || startsWith(github.head_ref, 'hotfix/'))) ||
+      (github.event.pull_request.base.ref == 'main' && (startsWith(github.head_ref, 'feature/') || startsWith(github.head_ref, 'hotfix/')))
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) Checkout
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4
+        with:
+          ref: ${{ github.head_ref }}
+
+      # 2) Setup Terraform
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@651471c36a6092792c552e8b1bef71e592b462d8  # v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # 3) Resolve env/account from branch
+      - name: Resolve environment/account by branch
+        id: resolve
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [[ ("$BASE_REF" =~ ^feature/ || "$BASE_REF" == "develop") && ("$HEAD_REF" =~ ^feature/ || "$HEAD_REF" =~ ^hotfix/) ]]; then
+            echo "tf_env=dev" >> "$GITHUB_OUTPUT"
+            echo "aws_account_id=${{ env.DEV_AWS_ACCOUNT_ID }}" >> "$GITHUB_OUTPUT"
+          elif [[ "$BASE_REF" == "main" && ( "$HEAD_REF" =~ ^feature/ || "$HEAD_REF" =~ ^hotfix/ ) ]]; then
+            echo "tf_env=prod" >> "$GITHUB_OUTPUT"
+            echo "aws_account_id=${{ env.PROD_AWS_ACCOUNT_ID }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unsupported branch mapping: BASE_REF=$BASE_REF, HEAD_REF=$HEAD_REF" >&2
+            exit 1
+          fi
+
+      # 4) Configure AWS OIDC
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4
+        with:
+          role-to-assume: arn:aws:iam::${{ steps.resolve.outputs.aws_account_id }}:role/${{ env.GITHUB_OIDC_ROLE }}
+          role-duration-seconds: 900
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 5) Terraform init
+      - name: Terraform Init
+        id: init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          INIT_LOG="init_error_pr${{ github.event.pull_request.number }}_run${{ github.run_id }}.log"
+          echo "init_log=$INIT_LOG" >> "$GITHUB_OUTPUT"
+
+          terraform init -no-color 2>&1 | tee "$INIT_LOG"
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            terraform workspace select -or-create "${{ steps.resolve.outputs.tf_env }}" 2>&1 | tee -a "$INIT_LOG"
+            EXIT_CODE=${PIPESTATUS[0]}
+          fi
+
+          echo "init_exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Terraform Init Debug
+        if: steps.init.outcome == 'failure'
+        run: |
+          echo "::error::Terraform Init Failed"
+          echo "Working directory: ${{ env.TF_DIR }}"
+          ls -la ${{ env.TF_DIR }}
+
+      # 6) Terraform validate
+      - name: Terraform Validate
+        id: validate
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          VALIDATE_LOG="validate_error_pr${{ github.event.pull_request.number }}_run${{ github.run_id }}.log"
+          echo "validate_log=$VALIDATE_LOG" >> "$GITHUB_OUTPUT"
+
+          terraform validate -no-color 2>&1 | tee "$VALIDATE_LOG"
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "validate_exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Terraform Validate Debug
+        if: steps.validate.outcome == 'failure'
+        run: |
+          echo "::error::Terraform Validate Failed"
+          cd ${{ env.TF_DIR }}
+          terraform validate
+
+      # 6.5) Gate: Fail if init or validate failed
+      - name: Check Init and Validate Status
+        if: steps.init.outcome == 'failure' || steps.validate.outcome == 'failure'
+        run: |
+          echo "::error::Terraform init or validate failed"
+          exit 1
+
+      # 7) Terraform plan
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_DIR }}
+        continue-on-error: true
+        run: |
+          PLAN_FILE="plan_output_pr${{ github.event.pull_request.number }}_run${{ github.run_id }}.txt"
+          PLAN_LOG="plan_error_pr${{ github.event.pull_request.number }}_run${{ github.run_id }}.log"
+
+          echo "plan_log=$PLAN_LOG" >> "$GITHUB_OUTPUT"
+
+          # Avoid shell pipe/wrapper edge cases so exit_code is always accurate (0/2/1).
+          set +e
+          terraform plan -no-color -detailed-exitcode -out=tfplan > "$PLAN_LOG" 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          cat "$PLAN_LOG"
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ $EXIT_CODE -eq 1 ]; then
+            # Keep only error log on plan failure
+            exit 1
+          fi
+
+          # For exit code 0/2, export rendered plan
+          echo "plan_file=$PLAN_FILE" >> "$GITHUB_OUTPUT"
+          terraform show -no-color tfplan > "$PLAN_FILE"
+
+      # 7.5) Detect IAM services required by the plan but not yet covered by POLICY_FILE
+      - name: Detect Missing IAM Policies
+        id: detect
+        if: steps.plan.outcome == 'success'
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          PLAN_FILE="${{ steps.plan.outputs.plan_file }}"
+
+          if [ "${{ steps.plan.outputs.exit_code }}" != "2" ] || ! [ -s "$PLAN_FILE" ]; then
+            echo "No infrastructure changes — no policy check needed"
+            echo "has_missing=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "=== Analyzing: $PLAN_FILE ==="
+
+          # Extract all Terraform resource types present in the plan
+          RESOURCE_TYPES=$(grep -oP '(?<=resource ")[^"]+' "$PLAN_FILE" | sort -u)
+          echo "=== Resource types in plan ==="
+          echo "$RESOURCE_TYPES"
+
+          # Extract IAM service prefixes already covered by the existing policy
+          EXISTING_SERVICES=$(jq -r '
+            [.Statement[].Action | if type == "array" then .[] else . end]
+            | .[] | split(":")[0]
+          ' "$GITHUB_WORKSPACE/${{ env.POLICY_FILE }}" | sort -u)
+          echo "=== Existing IAM service prefixes in policy ==="
+          echo "$EXISTING_SERVICES"
+
+          # Map Terraform resource type prefix -> IAM service prefix
+          get_service() {
+            case "$1" in
+              aws_ecs_*)                                                                       echo "ecs" ;;
+              aws_ecr_*)                                                                       echo "ecr" ;;
+              aws_sqs_*)                                                                       echo "sqs" ;;
+              aws_iam_*)                                                                       echo "iam" ;;
+              aws_cloudwatch_log_group*|aws_cloudwatch_log_*)                                  echo "logs" ;;
+              aws_cloudwatch_*)                                                                echo "cloudwatch" ;;
+              aws_lb_*|aws_alb_*)                                                              echo "elasticloadbalancing" ;;
+              aws_s3_*)                                                                        echo "s3" ;;
+              aws_lambda_*)                                                                    echo "lambda" ;;
+              aws_rds_*|aws_db_*)                                                              echo "rds" ;;
+              aws_elasticache_*)                                                               echo "elasticache" ;;
+              aws_security_group*|aws_vpc_*|aws_subnet_*|aws_route*|aws_internet_gateway*|aws_nat_gateway*) echo "ec2" ;;
+              aws_appautoscaling_*)                                                            echo "application-autoscaling" ;;
+              aws_ssm_*)                                                                       echo "ssm" ;;
+              aws_secretsmanager_*)                                                            echo "secretsmanager" ;;
+              aws_dynamodb_*)                                                                  echo "dynamodb" ;;
+              aws_kinesis_*)                                                                   echo "kinesis" ;;
+              aws_sns_*)                                                                       echo "sns" ;;
+              aws_api_gateway*|aws_apigatewayv2_*)                                             echo "apigateway" ;;
+              aws_cognito_*)                                                                   echo "cognito-idp" ;;
+              aws_wafv2_*)                                                                     echo "wafv2" ;;
+              aws_acm_*)                                                                       echo "acm" ;;
+              aws_route53_*)                                                                   echo "route53" ;;
+              aws_ses_*)                                                                       echo "ses" ;;
+              aws_sfn_*)                                                                       echo "states" ;;
+              aws_glue_*)                                                                      echo "glue" ;;
+              *)                                                                               echo "" ;;
+            esac
+          }
+
+          MISSING_SERVICES=""
+          while IFS= read -r resource_type; do
+            [ -z "$resource_type" ] && continue
+            SERVICE=$(get_service "$resource_type")
+            [ -z "$SERVICE" ] && continue
+            if ! echo "$EXISTING_SERVICES" | grep -qx "$SERVICE"; then
+              echo "MISSING: $resource_type -> $SERVICE"
+              MISSING_SERVICES="$MISSING_SERVICES $SERVICE"
+            fi
+          done <<< "$RESOURCE_TYPES"
+
+          MISSING_SERVICES=$(echo "$MISSING_SERVICES" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ' | xargs)
+
+          if [ -z "$MISSING_SERVICES" ]; then
+            echo "All services in the plan are covered by the existing policy"
+            echo "has_missing=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Missing services: $MISSING_SERVICES"
+            echo "has_missing=true" >> "$GITHUB_OUTPUT"
+            echo "missing_services=$MISSING_SERVICES" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 7.6) Merge the missing statements into the tracked policy file (does not touch live AWS
+      # permissions — the merge/apply workflow's own PolicyManager-role job grants those).
+      - name: Update terraform-deploy-policy.json
+        id: update_policy
+        if: steps.detect.outputs.has_missing == 'true'
+        env:
+          MISSING_SERVICES: ${{ steps.detect.outputs.missing_services }}
+        run: |
+          get_statement() {
+            case "$1" in
+              sqs)
+                echo '{"Sid":"SQSManage","Effect":"Allow","Action":["sqs:CreateQueue","sqs:DeleteQueue","sqs:GetQueueAttributes","sqs:SetQueueAttributes","sqs:ListQueues","sqs:TagQueue","sqs:UntagQueue","sqs:ListQueueTags","sqs:SendMessage","sqs:ReceiveMessage","sqs:DeleteMessage","sqs:PurgeQueue"],"Resource":"*"}'
+                ;;
+              ssm)
+                echo '{"Sid":"SSMManage","Effect":"Allow","Action":["ssm:GetParameter","ssm:GetParameters","ssm:GetParametersByPath","ssm:PutParameter","ssm:DeleteParameter","ssm:AddTagsToResource","ssm:ListTagsForResource","ssm:DescribeParameters"],"Resource":"*"}'
+                ;;
+              secretsmanager)
+                echo '{"Sid":"SecretsManagerManage","Effect":"Allow","Action":["secretsmanager:CreateSecret","secretsmanager:DeleteSecret","secretsmanager:GetSecretValue","secretsmanager:PutSecretValue","secretsmanager:UpdateSecret","secretsmanager:DescribeSecret","secretsmanager:TagResource","secretsmanager:UntagResource","secretsmanager:ListSecrets"],"Resource":"*"}'
+                ;;
+              lambda)
+                echo '{"Sid":"LambdaManage","Effect":"Allow","Action":["lambda:CreateFunction","lambda:DeleteFunction","lambda:GetFunction","lambda:UpdateFunctionCode","lambda:UpdateFunctionConfiguration","lambda:ListFunctions","lambda:AddPermission","lambda:RemovePermission","lambda:GetPolicy","lambda:TagResource","lambda:UntagResource","lambda:ListTags"],"Resource":"*"}'
+                ;;
+              rds)
+                echo '{"Sid":"RDSManage","Effect":"Allow","Action":["rds:CreateDBInstance","rds:DeleteDBInstance","rds:DescribeDBInstances","rds:ModifyDBInstance","rds:CreateDBSubnetGroup","rds:DeleteDBSubnetGroup","rds:DescribeDBSubnetGroups","rds:AddTagsToResource","rds:RemoveTagsFromResource","rds:ListTagsForResource"],"Resource":"*"}'
+                ;;
+              elasticache)
+                echo '{"Sid":"ElastiCacheManage","Effect":"Allow","Action":["elasticache:CreateReplicationGroup","elasticache:DeleteReplicationGroup","elasticache:DescribeReplicationGroups","elasticache:ModifyReplicationGroup","elasticache:CreateCacheSubnetGroup","elasticache:DeleteCacheSubnetGroup","elasticache:DescribeCacheClusters","elasticache:AddTagsToResource","elasticache:RemoveTagsFromResource","elasticache:ListTagsForResource"],"Resource":"*"}'
+                ;;
+              s3)
+                echo '{"Sid":"S3Manage","Effect":"Allow","Action":["s3:CreateBucket","s3:DeleteBucket","s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:HeadObject","s3:HeadBucket","s3:GetBucketPolicy","s3:PutBucketPolicy","s3:DeleteBucketPolicy","s3:GetBucketVersioning","s3:PutBucketVersioning","s3:GetBucketTagging","s3:PutBucketTagging","s3:GetLifecycleConfiguration","s3:PutLifecycleConfiguration"],"Resource":"*"}'
+                ;;
+              dynamodb)
+                echo '{"Sid":"DynamoDBManage","Effect":"Allow","Action":["dynamodb:CreateTable","dynamodb:DeleteTable","dynamodb:DescribeTable","dynamodb:UpdateTable","dynamodb:TagResource","dynamodb:UntagResource","dynamodb:ListTagsOfResource","dynamodb:DescribeTimeToLive","dynamodb:UpdateTimeToLive"],"Resource":"*"}'
+                ;;
+              sns)
+                echo '{"Sid":"SNSManage","Effect":"Allow","Action":["sns:CreateTopic","sns:DeleteTopic","sns:GetTopicAttributes","sns:SetTopicAttributes","sns:Subscribe","sns:Unsubscribe","sns:ListTopics","sns:TagResource","sns:UntagResource","sns:ListTagsForResource"],"Resource":"*"}'
+                ;;
+              route53)
+                echo '{"Sid":"Route53Manage","Effect":"Allow","Action":["route53:ChangeResourceRecordSets","route53:GetHostedZone","route53:ListHostedZones","route53:ListResourceRecordSets","route53:CreateHostedZone","route53:DeleteHostedZone","route53:ChangeTagsForResource"],"Resource":"*"}'
+                ;;
+              acm)
+                echo '{"Sid":"ACMManage","Effect":"Allow","Action":["acm:RequestCertificate","acm:DeleteCertificate","acm:DescribeCertificate","acm:GetCertificate","acm:ListCertificates","acm:AddTagsToCertificate","acm:RemoveTagsFromCertificate","acm:ListTagsForCertificate"],"Resource":"*"}'
+                ;;
+              cognito-idp)
+                echo '{"Sid":"CognitoManage","Effect":"Allow","Action":["cognito-idp:CreateUserPool","cognito-idp:DeleteUserPool","cognito-idp:DescribeUserPool","cognito-idp:UpdateUserPool","cognito-idp:CreateUserPoolClient","cognito-idp:DeleteUserPoolClient","cognito-idp:TagResource","cognito-idp:UntagResource","cognito-idp:ListTagsForResource"],"Resource":"*"}'
+                ;;
+              *)
+                SID=$(echo "AutoAdded_${1}" | tr '-' '_')
+                echo "{\"Sid\":\"${SID}\",\"Effect\":\"Allow\",\"Action\":[\"${1}:Describe*\",\"${1}:List*\",\"${1}:Get*\"],\"Resource\":\"*\"}"
+                ;;
+            esac
+          }
+
+          NEW_STATEMENTS="[]"
+          for svc in $MISSING_SERVICES; do
+            STMT=$(get_statement "$svc")
+            NEW_STATEMENTS=$(echo "$NEW_STATEMENTS" | jq --argjson s "$STMT" '. + [$s]')
+          done
+
+          # Only append statements whose Sid isn't already present (idempotent re-runs).
+          jq --argjson new "$NEW_STATEMENTS" '
+            .Statement as $existing
+            | ($existing | map(.Sid)) as $existingSids
+            | .Statement = $existing + ($new | map(select(.Sid as $s | $existingSids | index($s) | not)))
+          ' "${{ env.POLICY_FILE }}" > /tmp/policy.json
+          mv /tmp/policy.json "${{ env.POLICY_FILE }}"
+
+          # jq strips the trailing newline — restore it for a clean diff.
+          printf '\n' >> "${{ env.POLICY_FILE }}"
+
+          echo "=== Updated ${{ env.POLICY_FILE }} ==="
+          cat "${{ env.POLICY_FILE }}"
+
+      # 7.7) Push the policy update back onto the PR branch for review (same-repo PRs only —
+      # forked PRs don't get a token with push access, so this step is skipped for them).
+      - name: Commit and Push Policy Update
+        if: steps.update_policy.outcome == 'success' && github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add "${{ env.POLICY_FILE }}"
+          if git diff --cached --quiet; then
+            echo "No policy changes to commit"
+          else
+            git commit -m "ci: auto-update IAM policy for new Terraform resources [skip ci]"
+            git push origin "HEAD:${{ github.head_ref }}"
+          fi
+
+      # 8) Upload plan/log artifact
+      - name: Upload full plan artifact
+        if: always() && steps.resolve.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-pr${{ github.event.pull_request.number }}-${{ steps.resolve.outputs.tf_env }}-${{ github.run_id }}
+          path: |
+            ${{ env.TF_DIR }}/${{ steps.init.outputs.init_log }}
+            ${{ env.TF_DIR }}/${{ steps.validate.outputs.validate_log }}
+            ${{ env.TF_DIR }}/${{ steps.plan.outputs.plan_file }}
+            ${{ env.TF_DIR }}/${{ steps.plan.outputs.plan_log }}
+          if-no-files-found: warn
+          retention-days: 14
+
+       # 9) Comment on PR with plan output
+      - name: Comment PR with Plan Result
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+            github-token: ${{ secrets.GITHUB_TOKEN }}
+            script: |
+             const fs = require('fs');
+             const path = require('path');
+             const environment = '${{ steps.resolve.outputs.tf_env }}';
+             const initLog = '${{ steps.init.outputs.init_log }}';
+             const validateLog = '${{ steps.validate.outputs.validate_log }}';
+             const planFile = '${{ steps.plan.outputs.plan_file }}';
+             const planLog = '${{ steps.plan.outputs.plan_log }}';
+             const initOutcome = '${{ steps.init.outcome }}';
+             const validateOutcome = '${{ steps.validate.outcome }}';
+             const planOutcome = '${{ steps.plan.outcome }}';
+             const rawExitCode = '${{ steps.plan.outputs.exit_code }}';
+             const parsedExitCode = Number.parseInt(rawExitCode, 10);
+             const exitCode = Number.isNaN(parsedExitCode) ? -1 : parsedExitCode;
+             const hasMissingPolicy = '${{ steps.detect.outputs.has_missing }}';
+             const missingServices = '${{ steps.detect.outputs.missing_services }}';
+             const policyUpdateOutcome = '${{ steps.update_policy.outcome }}';
+             const policyPushed = '${{ github.event.pull_request.head.repo.full_name == github.repository }}' === 'true';
+             const planDir = '${{ env.TF_DIR }}';
+             const initLogPath = path.join(planDir, initLog);
+             const validateLogPath = path.join(planDir, validateLog);
+             const planPath = path.join(planDir, planFile);
+             const planLogPath = path.join(planDir, planLog);
+             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+             let planOutput = '';
+             let planStatus = '❌ Failed';
+             let initStatus = initOutcome === 'success' ? '✅' : '❌';
+             let validateStatus = validateOutcome === 'success' ? '✅' : '❌';
+             let planStatus_step = planOutcome === 'success' ? '✅' : '❌';
+
+             function readLogFile(logPath, fallbackMessage) {
+               if (!logPath || !fs.existsSync(logPath)) {
+                 return fallbackMessage;
+               }
+
+               try {
+                 return fs.readFileSync(logPath, 'utf8');
+               } catch (err) {
+                 return `Error reading log file: ${err.message}`;
+               }
+             }
+
+             // Determine plan status based on terraform exit code
+             if (initOutcome === 'failure' || validateOutcome === 'failure') {
+               planStatus = '❌ Failed (Init/Validate)';
+               const sections = [];
+
+               if (initOutcome === 'failure') {
+                 const initError = readLogFile(
+                   initLogPath,
+                   'Terraform init failed, but init log file was not found. Check workflow logs.'
+                 );
+                 sections.push(`--- INIT ERROR ---\n${initError}`);
+               }
+
+               if (validateOutcome === 'failure') {
+                 const validateError = readLogFile(
+                   validateLogPath,
+                   'Terraform validate failed, but validate log file was not found. Check workflow logs.'
+                 );
+                 sections.push(`--- VALIDATE ERROR ---\n${validateError}`);
+               }
+
+               planOutput = sections.join('\n\n');
+             } else if (planOutcome === 'failure') {
+               planStatus = '❌ Failed';
+               // If plan failed, try to read error log
+               if (planLog && fs.existsSync(planLogPath)) {
+                 try {
+                   planOutput = fs.readFileSync(planLogPath, 'utf8');
+                   console.log('Error log file found and read successfully');
+                 } catch (err) {
+                   console.error('Error reading log file:', err);
+                   planOutput = `Error reading log file: ${err.message}`;
+                 }
+               } else {
+                 planOutput = 'Failed to run terraform plan. Check error logs in artifacts.';
+               }
+             } else if (planOutcome === 'success') {
+               // exit_code 0 = no changes, 2 = has changes
+               if (exitCode === 0) {
+                 planStatus = '✅ No changes';
+                 planOutput = 'Terraform plan completed with no changes.';
+               } else if (exitCode === 2) {
+                 planStatus = '⚠️ Changes detected';
+                 // Try to read plan output file
+                 if (planFile && fs.existsSync(planPath)) {
+                   try {
+                     const stats = fs.statSync(planPath);
+                     if (stats.isFile()) {
+                       planOutput = fs.readFileSync(planPath, 'utf8');
+                     }
+                   } catch (err) {
+                     console.error('Error reading plan file:', err);
+                     planOutput = `Error reading plan file: ${err.message}`;
+                   }
+                 } else {
+                   planOutput = `Plan file not found at: ${planPath}`;
+                 }
+               } else {
+                 planStatus = '❓ Unknown';
+                 planOutput = `Unexpected exit code: ${exitCode}`;
+               }
+             } else {
+               planStatus = '❌ Failed';
+               planOutput = 'Plan file output not available (likely due to init/validation failure)';
+             }
+
+             const maxLength = 65000;
+             const isTruncated = planOutput.length > maxLength;
+             const truncatedPlan = isTruncated
+               ? planOutput.substring(0, maxLength) + '\n\n... (truncated)'
+               : planOutput;
+             const isFailure = planStatus.startsWith('❌');
+             const errorPreviewLineLimit = 35;
+             const errorPreview = isFailure
+               ? truncatedPlan.split('\n').slice(0, errorPreviewLineLimit).join('\n')
+               : '';
+
+             let policySection = '';
+             if (hasMissingPolicy === 'true') {
+               if (policyUpdateOutcome === 'success' && policyPushed) {
+                 policySection = `\n\n### 🔄 IAM Policy Auto-Updated\n\n` +
+                   `Missing IAM permissions for: \`${missingServices}\`\n\n` +
+                   `\`.github/iam/terraform-deploy-policy.json\` was updated and pushed to this branch — review the added permissions before merging.\n\n` +
+                   `> ⚠️ This only updates the tracked policy file. The live AWS permissions on \`Chatrix-GithubAction\` are still granted separately by the Terraform Apply workflow at merge time.`;
+               } else if (policyUpdateOutcome === 'success') {
+                 policySection = `\n\n### ⚠️ IAM Policy Coverage\n\n` +
+                   `Missing IAM permissions for: \`${missingServices}\`\n\n` +
+                   `This PR is from a fork, so the policy file could not be auto-pushed. Add the missing permissions to \`.github/iam/terraform-deploy-policy.json\` manually.`;
+               } else {
+                 policySection = `\n\n### ⚠️ IAM Policy Coverage\n\n` +
+                   `Missing IAM permissions for: \`${missingServices}\`, but updating the policy file failed. Check workflow logs.`;
+               }
+             } else if (hasMissingPolicy === 'false') {
+               policySection = '\n\n### ✅ IAM Policy Coverage\n\nAll required IAM actions are already present in `.github/iam/terraform-deploy-policy.json`.';
+             }
+
+             const commentTag = `Terraform Plan Result for \`${environment}\` environment`;
+             const output = `### ${commentTag} [${planStatus}]
+
+             **Step Status:**
+             - Init: ${initStatus}
+             - Validate: ${validateStatus}
+             - Plan: ${planStatus_step}
+             - Exit Code: ${exitCode}
+
+             ${isFailure ? `**Error Preview (first ${errorPreviewLineLimit} lines):**
+
+             \`\`\`terraform
+             ${errorPreview}
+             \`\`\`` : ''}
+
+             <details>
+             <summary>Show Plan/Errors</summary>
+
+             \`\`\`terraform
+             ${truncatedPlan}
+             \`\`\`
+
+             </details>
+
+             ${isTruncated ? `⚠️ Output is too long and has been truncated in this comment. View the full output in workflow run artifacts: ${runUrl}` : ''}
+             ${policySection}
+
+             *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+             const { data: comments } = await github.rest.issues.listComments({
+               owner: context.repo.owner,
+               repo: context.repo.repo,
+               issue_number: context.issue.number,
+             });
+
+             const botComment = comments.find(comment =>
+               comment.user.type === 'Bot' && comment.body.includes(commentTag)
+             );
+
+             if (botComment) {
+               await github.rest.issues.updateComment({
+                 owner: context.repo.owner,
+                 repo: context.repo.repo,
+                 comment_id: botComment.id,
+                 body: output
+               });
+             } else {
+               await github.rest.issues.createComment({
+                 owner: context.repo.owner,
+                 repo: context.repo.repo,
+                 issue_number: context.issue.number,
+                 body: output
+               });
+             }
+
+      # 10) Fail workflow if plan failed
+      - name: Terraform Plan Status Check
+        if: steps.plan.outcome == 'failure'
+        run: |
+          echo "::error::Terraform plan failed. Check PR comment and workflow logs for details."
+          exit 1
